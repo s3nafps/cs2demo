@@ -21,6 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--post-roll", type=float, default=2.0, help="Seconds kept after the moment")
     analyze.add_argument("--streak-gap", type=float, default=10.0, help="Max seconds between kills in one multikill")
     analyze.add_argument("--max-clips", type=int, help="Keep only the N highest-scoring clips")
+    analyze.add_argument("--players", type=int, nargs="+", metavar="STEAMID",
+                         help="Only highlights where these players (steamid64) are the POV")
+    analyze.add_argument("--rounds", type=int, nargs="+", metavar="N",
+                         help="Only highlights from these round numbers")
 
     export = sub.add_parser("export", help="Render a plan's clips into 16:9 and/or 9:16 files.")
     export.add_argument("plan", type=Path, help="Plan JSON written by 'analyze'")
@@ -37,23 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
-    from .detect import DetectConfig, detect_highlights
     from .parse import load_demo
-    from .planner import PlanConfig, build_plan, save_plan
+    from .pipeline import HighlightOptions, plan_highlights
+    from .planner import save_plan
+    from .selection import Selection
 
     if not args.demo.is_file():
         print(f"error: demo not found: {args.demo}", file=sys.stderr)
         return 2
 
-    meta, rounds, kills, rosters = load_demo(args.demo)
-    highlights = detect_highlights(
-        rounds, kills, rosters, DetectConfig(tickrate=meta.tickrate, streak_gap_s=args.streak_gap)
-    )
-    plan = build_plan(
-        highlights,
-        rounds,
-        meta,
-        PlanConfig(
+    data = load_demo(args.demo)
+    selection = Selection.of(players=args.players, rounds=args.rounds)
+    plan = plan_highlights(
+        data,
+        selection,
+        HighlightOptions(
+            streak_gap_s=args.streak_gap,
             pre_roll_s=args.pre_roll,
             post_roll_s=args.post_roll,
             min_score=args.min_score,
@@ -64,7 +67,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     output = args.output or args.demo.with_name(args.demo.stem + ".plan.json")
     save_plan(plan, output)
 
-    print(f"{meta.demo_name} | map {meta.map_name} | {len(rounds)} rounds | {len(kills)} kills")
+    meta = data.meta
+    print(f"{meta.demo_name} | map {meta.map_name} | {len(data.rounds)} rounds | {len(data.kills)} kills")
     if not plan.clips:
         print("No clips passed the score threshold.")
     for clip in plan.clips:

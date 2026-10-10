@@ -37,7 +37,7 @@ def export_plan(
     results: list[ExportResult] = []
 
     for clip in plan.clips:
-        source = _find_recording(recordings_dir, clip.id)
+        source = recording_for(recordings_dir, clip.id)
         for aspect in aspects:
             if source is None:
                 results.append(
@@ -55,6 +55,9 @@ def export_plan(
     return results
 
 
-def _find_recording(recordings_dir: Path, clip_id: str) -> Path | None:
+def recording_for(recordings_dir: Path, clip_id: str) -> Path | None:
     matches = sorted(recordings_dir.glob(f"{clip_id}.*"))
     return matches[0] if matches else None
+
+
+_find_recording = recording_for

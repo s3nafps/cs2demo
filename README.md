@@ -1,38 +1,45 @@
 # cs2hl: local CS2 highlight generator
 
-Finds the highlight moments in a CS2 demo (multikills, clutches, aces) and exports
-them as clips in 16:9 and 9:16, so you don't need an online service.
+Pick a CS2 demo, choose the player and rounds, and get highlight clips in 16:9 and 9:16.
+Everything runs on your PC. The desktop app records clips through HLAE and CS2.
 
-**Status: early.** The analysis, planning and export pipeline works and is tested.
-Parsing a real `.dem` file and recording clips from CS2 are not verified yet. See
-[Status](#status) and [docs/DESIGN.md](docs/DESIGN.md).
+**Status: early.** Analysis, the desktop UI, the export step and the HLAE command
+generator are built and tested. Parsing a real `.dem` file and recording from CS2 have
+not been run yet. See [Status](#status).
 
-## Quick start
-
-Requires Python 3.11+ and [FFmpeg](https://ffmpeg.org/) on your PATH.
+## Desktop app
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e ".[dev]"        # Windows: .venv\Scripts\pip install -e ".[dev]"
-
-# 1. Find highlights in a demo and write a plan
-cs2hl analyze match.dem                   # -> match.plan.json
-
-# 2. Record each clip in CS2 as <clip id>.mp4 in a folder (capture step, not yet built)
-
-# 3. Export each clip to 16:9 and 9:16
-cs2hl export match.plan.json --recordings recordings/ --out output/ \
-    --aspect 16x9 9x16 --vertical-mode crop --short-side 1080
+.venv/bin/pip install -e ".[gui,dev]"          # Windows: .venv\Scripts\pip install -e ".[gui,dev]"
+.venv/bin/cs2hl-gui                             # or: .venv/bin/python -m cs2hl.gui
 ```
 
-Useful options:
+1. **Open demo.** The app scans it in the background: map, duration, rounds and players.
+2. **Pick rounds** (all are included by default) and **tick the player(s)** to make highlights for.
+3. **Preview highlights** lists the clips that would be made.
+4. **Render** records each clip and exports the aspects you chose. The Backend setting
+   chooses "Plan only" (write the plan JSON and stop) or HLAE (record in CS2).
 
-- `analyze --min-score 6 --max-clips 10 --pre-roll 5 --post-roll 2`
-- `export --vertical-mode fit` keeps the full frame over a blurred background
-- `export --x-offset 0.6` shifts the 9:16 crop window right, to keep the kill feed
-- `export --short-side 1440` or `2160` for higher resolution, `--crf 16` for more quality
+Settings are remembered between runs.
 
-## What it detects (v1)
+## Command line
+
+```bash
+cs2hl analyze match.dem --players 76561198000000000 --rounds 1 2 3 --max-clips 10
+cs2hl export match.plan.json --recordings recordings/ --aspect 16x9 9x16 --vertical-mode crop
+```
+
+`--players` takes SteamID64 values. `cs2hl analyze` without `--players` includes everyone.
+
+## Requirements
+
+- Windows for recording. HLAE only runs on Windows.
+- Counter-Strike 2 and [HLAE](https://github.com/advancedfx/advancedfx/releases) installed separately.
+- FFmpeg. The packaged app expects `ffmpeg.exe` next to it. HLAE needs its own ffmpeg:
+  `<HLAE>\ffmpeg\bin\ffmpeg.exe`, or a path in `<HLAE>\ffmpeg\ffmpeg.ini`.
+
+## Highlights (v1)
 
 | Kind | Meaning | Example label |
 |---|---|---|
@@ -40,38 +47,46 @@ Useful options:
 | clutch | last player alive vs N enemies, and the team wins the round | `1v2` |
 | team ace | one side kills every enemy alive at round start | `TEAM ACE` |
 
-Bonuses for headshots, noscopes, through smoke, wallbangs and knife kills, plus a
-win bonus. The weights live in `cs2hl/scoring.py` and are a first guess to tune.
+Bonuses for headshots, noscopes, through smoke, wallbangs and knife kills, and a win
+bonus. The weights are in `cs2hl/scoring.py` and are first guesses.
 
 ## Layout
 
 ```
 cs2hl/
-  parse.py      demoparser2 -> models (rounds, kills, rosters)     [not yet verified on a real demo]
-  detect.py     multikills, clutches, team aces                    [pure, tested]
-  scoring.py    highlight scores and bonuses                       [pure, tested]
-  planner.py    clip windows, merging, plan JSON                   [pure, tested]
-  ffmpeg.py     16:9 / 9:16 reframing and H.264 encoding           [tested with real ffmpeg]
-  export.py     plan -> rendered files                             [tested]
-  cli.py        `cs2hl analyze` and `cs2hl export`
-tests/          pytest suite (28 tests)
-docs/DESIGN.md  research on similar projects, decisions, open questions
+  parse.py          demoparser2 -> DemoData                      [not yet run on a real demo]
+  scan.py           players and rounds summary for the UI         [tested]
+  detect.py         multikills, clutches, team aces               [tested]
+  selection.py      keep the chosen players and rounds            [tested]
+  pipeline.py       plan_highlights, render_plan                  [tested]
+  planner.py        clip windows, merging, plan JSON              [tested]
+  capture/
+    base.py         backend contract (CaptureBackend)
+    hlae.py         HLAE recording: session cfg, sessions, move   [source-checked, not run in CS2]
+  export.py         plan -> 16:9 / 9:16 files                     [tested]
+  ffmpeg.py         reframing, H.264 encoding, tool lookup        [tested with real ffmpeg]
+  gui/              PySide6 desktop app                           [tested offscreen]
+packaging/          PyInstaller spec and notes                    [built on Linux]
+.github/workflows/  windows-build.yml                             [not run yet]
+docs/DESIGN.md      research, verified facts, open questions
 ```
 
 ## Status
 
 | Part | State |
 |---|---|
-| Detection, scoring, planning, plan JSON | Done, unit-tested |
+| Analysis, selection, planning, plan JSON | Done, tested |
+| Desktop UI (scan, rounds, players, preview, render, cancel) | Done, tested offscreen |
 | 16:9 / 9:16 reframing and encoding | Done, verified with ffmpeg on synthetic video |
-| demoparser2 adapter (`parse.py`) | Written and tested with fake parser data. **Not run on a real `.dem` yet**, so column names may need small fixes |
-| CS2 capture (recording clips from the game) | Not started. Needs a decision on the backend, see DESIGN.md |
-| Local UI | Not started |
+| HLAE backend | Written. Recording commands checked against HLAE's CS2 source. Not run against CS2 yet |
+| Parsing a real `.dem` | **Not yet verified.** demoparser2 column names are unconfirmed |
+| POV selection in CS2 demos | **Not solved.** HLAE has no CS2 POV command. The recording shows the demo's own camera |
+| Windows build | Spec builds on Linux. Windows build runs in CI, not yet run |
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest
+QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest
 ```
 
 Integration tests skip automatically when FFmpeg is not installed.

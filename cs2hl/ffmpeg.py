@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -15,6 +17,33 @@ VerticalMode = Literal["crop", "fit"]
 
 class FFmpegError(RuntimeError):
     pass
+
+
+def _no_window_flags() -> int:
+    """A windowed Windows build would open a console for every ffmpeg call without this."""
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        return subprocess.CREATE_NO_WINDOW
+    return 0
+
+
+def find_tool(name: str) -> str | None:
+    """Locate ffmpeg or ffprobe.
+
+    Order: CS2HL_FFMPEG_DIR env var, the folder of the packaged exe (when frozen),
+    the current folder, then PATH. The packaged build ships ffmpeg.exe next to the exe.
+    """
+    exe = f"{name}.exe" if os.name == "nt" else name
+    candidates: list[Path] = []
+    env_dir = os.environ.get("CS2HL_FFMPEG_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir) / exe)
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).parent / exe)
+    candidates.append(Path.cwd() / exe)
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which(name)
 
 
 @dataclass(frozen=True)
@@ -105,17 +134,23 @@ def _filter_graph(aspect: Aspect, w: int, h: int, vertical_mode: VerticalMode, x
 
 
 def run(cmd: list[str]) -> None:
-    if shutil.which(cmd[0]) is None:
-        raise FFmpegError(f"{cmd[0]} not found on PATH. Install FFmpeg and try again.")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    tool = find_tool(cmd[0])
+    if tool is None:
+        raise FFmpegError(f"{cmd[0]} not found. Install FFmpeg, or place {cmd[0]}.exe next to the app.")
+    result = subprocess.run(
+        [tool, *cmd[1:]], capture_output=True, text=True, creationflags=_no_window_flags()
+    )
     if result.returncode != 0:
         raise FFmpegError(result.stderr.strip() or f"{cmd[0]} exited with {result.returncode}")
 
 
 def probe(path: Path) -> dict:
+    ffprobe = find_tool("ffprobe")
+    if ffprobe is None:
+        raise FFmpegError("ffprobe not found. Install FFmpeg, or place ffprobe.exe next to the app.")
     result = subprocess.run(
         [
-            "ffprobe",
+            ffprobe,
             "-v",
             "error",
             "-print_format",
@@ -127,6 +162,7 @@ def probe(path: Path) -> dict:
         capture_output=True,
         text=True,
         check=True,
+        creationflags=_no_window_flags(),
     )
     data = json.loads(result.stdout)
     video = next(s for s in data["streams"] if s["codec_type"] == "video")

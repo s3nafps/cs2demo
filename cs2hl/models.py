@@ -76,3 +76,14 @@ class Clip:
 class Plan:
     meta: DemoMeta
     clips: list[Clip] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DemoData:
+    """Everything parsed from one demo. Returned by ``parse.load_demo``."""
+
+    meta: DemoMeta
+    rounds: list[Round]
+    kills: list[Kill]
+    rosters: Rosters
+    player_names: dict[int, str]

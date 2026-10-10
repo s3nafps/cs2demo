@@ -1,0 +1,63 @@
+name: windows-build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cs2hl with the GUI extra and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[gui]"
+          python -m pip install "pyinstaller==6.22.3"
+
+      # Third-party download: gyan.dev publishes this as its latest release-essentials build.
+      # Check the URL and the build before a release. Only bin/ffmpeg.exe is kept.
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          New-Item -ItemType Directory -Force -Path ffmpeg-download | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg-download/ffmpeg.zip
+          Expand-Archive -Path ffmpeg-download/ffmpeg.zip -DestinationPath ffmpeg-download/unpacked
+          $exe = Get-ChildItem -Path ffmpeg-download/unpacked -Recurse -Filter ffmpeg.exe |
+            Where-Object { $_.Directory.Name -eq "bin" } |
+            Select-Object -First 1
+          if (-not $exe) { throw "bin/ffmpeg.exe not found in the archive" }
+          Copy-Item $exe.FullName -Destination ffmpeg-download/ffmpeg.exe
+
+      # HLAE is not bundled: the user installs it separately and points the app at it.
+      - name: Build cs2hl-gui.exe
+        run: pyinstaller packaging/cs2hl-gui.spec --noconfirm --distpath dist --workpath build
+
+      - name: Place ffmpeg.exe next to the executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path dist/cs2hl-gui.exe)) { throw "dist/cs2hl-gui.exe was not built" }
+          Copy-Item ffmpeg-download/ffmpeg.exe -Destination dist/ffmpeg.exe
+          & dist/ffmpeg.exe -version | Select-Object -First 1
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: cs2hl-gui-windows
+          path: dist/
+          if-no-files-found: error

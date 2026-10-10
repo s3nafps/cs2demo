@@ -83,3 +83,62 @@ These decide the next steps. Please answer what you can.
    (e.g. long-range sniper kills, spray control) only if they show up in practice.
 4. Local UI: list highlights, preview, toggle clips, export.
 5. Package for Windows (PyInstaller or similar), so it runs without installing Python.
+
+## 6. HLAE check against its source (2026-10-10)
+
+The first research pass read HLAE's documentation, which does not list `mirv_streams`
+for CS2. HLAE's source does. The clone used is `advancedfx/advancedfx` at commit
+`ebbcd88`, read-only. The findings below are from code, not from docs.
+
+Verified in the CS2 build (`AfxHookSource2/` and `shared/`, which the CS2 CMake compiles):
+
+| Need | Command | Where |
+|---|---|---|
+| Recording to ffmpeg | `mirv_streams record screen enabled 1`, `mirv_streams record screen settings <name>` | `RenderSystemDX11Hooks.cpp` (`Console_RecordScreen`) |
+| Custom ffmpeg preset | `mirv_streams settings add ffmpeg <name> "<options>"` (name must not start with `afx`) | `shared/RecordingSettings.cpp` |
+| Output folder | `mirv_streams record name <path>`, then `<path>\take0000\` per start | `RenderSystemDX11Hooks.cpp` (`RecordStart`) |
+| Frame rate | `mirv_streams record fps <value>` | `RenderSystemDX11Hooks.cpp` |
+| Timed commands | `mirv_cmd addAtTick <tick> <command...>`, keyed on the **demo** tick | `shared/CommandSystem.cpp`, `AfxHookSource2/main.cpp` |
+| Seek | `demo_gototick <tick>` (HLAE's `mirv_skip` sends it) | `AfxHookSource2/main.cpp` |
+| ffmpeg binary | `<HLAE>\ffmpeg\ffmpeg.ini` [Ffmpeg] path, else `<HLAE>\ffmpeg\bin\ffmpeg.exe` | `shared/AfxOutStreams.cpp` |
+
+Not in the CS2 build:
+
+- `mirv_pov` (POV for GOTV demos) and any CS2 spectator setter. The only POV code
+  reads the observer target. `spec_player` exists only in the CS:GO tree. So the app
+  cannot yet choose a player's view in a CS2 demo. The recording shows the demo's camera.
+
+Consequences for the design:
+
+1. Clips that overlap in demo time cannot share one CS2 session. The HLAE backend runs
+   one session per group of non-overlapping clips, so overlapping highlights take
+   extra CS2 runs.
+2. `mirv_cmd addAtTick` joins its parts with single spaces and drops quotes, so the
+   record folder is a relative path with no spaces, resolved from `game\bin\win64`.
+   The working directory is supported only by a changelog note, not by running CS2.
+3. A preset name cannot be redefined in one CS2 run. The app always uses `cs2hl_h264`.
+
+## 7. Still unverified (needs a real CS2 run and a real demo)
+
+- Column names in demoparser2 output. The raw CS2 event fields are `attacker` and
+  `userid` (controller entities). The adapter in `cs2hl/parse.py` assumes
+  `attacker_steamid`, `user_steamid`, `attacker_name`, and team numbers 2/3 for the
+  round winner. Those need checking on the first real demo.
+- Whether `exec cs2hl/session` finds `game\csgo\cs2hl\session.cfg`, and whether
+  `playdemo cs2hl/<name>` resolves the copied demo.
+- Whether `quit` at a tick ends CS2, and whether `record end` at a tick runs before
+  the seek to the next clip.
+- POV: whether `spec_player <slot>` switches the view in CS2 demo playback, and how
+  to map a SteamID to a slot.
+- Whether HLAE's custom loader starts with `-customLoader -programPath ... -cmdLine
+  "-steam -insecure +exec ..."` as the `hlae_launch_command` helper assumes.
+- Windows packaging: PyInstaller output on Windows, and the ffmpeg download in CI.
+
+## 8. Next steps
+
+1. Run `cs2hl-gui` on a real demo on the Windows PC. Check the rounds and players
+   tables against what you see in the match.
+2. Record one short clip with the HLAE backend. Confirm the generated `session.cfg`
+   runs, the take folder appears, and the clip reaches `recordings/`.
+3. Decide POV: find the CS2 command that switches the view, or accept the demo camera
+   for now.

@@ -12,13 +12,13 @@ import bisect
 from pathlib import Path
 from typing import Any
 
-from .models import DemoMeta, Kill, Rosters, Round, Side
+from .models import DemoData, DemoMeta, Kill, Rosters, Round, Side
 
 DEFAULT_TICKRATE = 64.0
 TEAM_SIDE: dict[int, Side] = {2: "T", 3: "CT"}
 
 
-def load_demo(path: Path) -> tuple[DemoMeta, list[Round], list[Kill], Rosters]:
+def load_demo(path: Path) -> DemoData:
     # Imported here so the pure modules stay importable without the parser installed.
     from demoparser2 import DemoParser
 
@@ -31,9 +31,9 @@ def load_demo(path: Path) -> tuple[DemoMeta, list[Round], list[Kill], Rosters]:
     )
 
     rounds = _rounds(parser)
-    rosters = _rosters(parser, rounds)
+    rosters, names = _rosters(parser, rounds)
     kills = _kills(parser, rounds, rosters)
-    return meta, rounds, kills, rosters
+    return DemoData(meta=meta, rounds=rounds, kills=kills, rosters=rosters, player_names=names)
 
 
 def _tickrate(header: dict[str, Any]) -> float:
@@ -84,24 +84,28 @@ def _rounds(parser: Any) -> list[Round]:
     return rounds
 
 
-def _rosters(parser: Any, rounds: list[Round]) -> Rosters:
+def _rosters(parser: Any, rounds: list[Round]) -> tuple[Rosters, dict[int, str]]:
     if not rounds:
-        return {}
+        return {}, {}
     ticks_df = parser.parse_ticks(
         ["team_num", "health", "name"], ticks=[r.start_tick for r in rounds]
     )
     by_tick = {int(t): rows for t, rows in ticks_df.groupby("tick")}
 
     rosters: Rosters = {}
+    names: dict[int, str] = {}
     for rnd in rounds:
         roster: dict[int, Side] = {}
         rows = by_tick.get(rnd.start_tick)
         for row in rows.to_dict("records") if rows is not None else []:
+            steamid = _int(row.get("steamid"))
+            if row.get("name"):
+                names[steamid] = str(row["name"])
             side = TEAM_SIDE.get(_int(row.get("team_num")))
             if side and _int(row.get("health")) > 0:
-                roster[_int(row.get("steamid"))] = side
+                roster[steamid] = side
         rosters[rnd.number] = roster
-    return rosters
+    return rosters, names
 
 
 def _kills(parser: Any, rounds: list[Round], rosters: Rosters) -> list[Kill]:

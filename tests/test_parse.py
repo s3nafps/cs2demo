@@ -71,16 +71,17 @@ def test_rounds_skip_duplicate_starts_and_pair_with_the_next_end():
 def test_rosters_only_include_living_players_with_a_team():
     fake = build_fake()
     rounds = parse._rounds(fake)
-    rosters = parse._rosters(fake, rounds)
+    rosters, names = parse._rosters(fake, rounds)
 
     assert rosters[1] == {1: "T", 2: "T", 11: "CT"}  # 12 is dead at round start
     assert rosters[2] == {1: "T", 11: "CT"}
+    assert names == {1: "alpha", 2: "bravo", 11: "carl", 12: "dead"}
 
 
 def test_kills_drop_warmup_gaps_team_kills_and_world_damage():
     fake = build_fake()
     rounds = parse._rounds(fake)
-    rosters = parse._rosters(fake, rounds)
+    rosters, _ = parse._rosters(fake, rounds)
     kills = parse._kills(fake, rounds, rosters)
 
     assert [(k.tick, k.round_num) for k in kills] == [(100, 1), (200, 1), (7000, 2)]
