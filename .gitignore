@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# demos and render outputs are large and personal; never commit them
+*.dem
+output/
+recordings/
+*.plan.json
