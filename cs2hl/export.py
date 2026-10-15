@@ -14,9 +14,12 @@ Outputs in ``out_dir``:
 from __future__ import annotations
 
 import glob
+import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence, get_args
+from threading import Event
+from typing import Callable, Iterable, Sequence, get_args
 
 from . import ffmpeg
 from .ffmpeg import Aspect, EncodeSettings, Recording, VerticalMode
@@ -26,6 +29,9 @@ MONTAGE_ID = "montage"
 PARTS_DIR = ".parts"
 # Recognised recording containers, most preferred first when several share a name.
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v")
+# A clip file written for a planner clip id (clipNNN_rNN), as clip_file_name names it.
+CLIP_FILE = re.compile(r"clip\d{3,}_r\d{2,}_(?:%s)\.mp4" % "|".join(map(re.escape, get_args(Aspect))))
+PIECE_SUFFIX = re.compile(r"_s\d+$")
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,7 @@ def export_plan(
     x_offset: float = 0.0,
     output: OutputMode = "clips",
     log: Callable[[str], None] | None = None,
+    cancel: Event | None = None,
 ) -> list[ExportResult]:
     """Export every clip of ``plan`` to each aspect, as clips, a montage or both.
 
@@ -56,6 +63,9 @@ def export_plan(
     ``out_dir/.parts`` with PCM audio, the parts are joined with a video stream copy,
     and in "both" mode each clip file is remuxed from its part. ``.parts`` is removed
     at the end.
+
+    A set ``cancel`` stops the export before the next encode or join and stops a running
+    ffmpeg. The videos finished by then are returned; partial files are removed.
     """
     if output not in get_args(OutputMode):
         raise ValueError(f"unknown output mode: {output}")
@@ -66,44 +76,87 @@ def export_plan(
     out_dir.mkdir(parents=True, exist_ok=True)
     parts_dir = out_dir / PARTS_DIR
 
-    sources = {clip.id: _load_recordings(recordings_dir, clip) for clip in plan.clips}
     results: list[ExportResult] = []
+    parts: list[Path] = []
     total = len(plan.clips) * len(aspects)
     done = 0
-    for aspect in aspects:
-        parts: list[Path] = []
-        for clip in plan.clips:
-            done += 1
-            source = sources[clip.id]
-            if isinstance(source, str):
-                results.append(ExportResult(clip.id, aspect, error=source))
-                continue
-            say(f"Exporting {clip.id} {aspect} ({done}/{total})")
-            final = out_dir / clip_file_name(clip.id, aspect)
-            try:
-                if want_montage:
-                    parts_dir.mkdir(exist_ok=True)
-                    part = parts_dir / f"{clip.id}_{aspect}.mov"
-                    _encode(source, part, aspect, settings, vertical_mode, x_offset, "pcm")
-                    parts.append(part)
-                    if want_clips:
-                        ffmpeg.run_to(ffmpeg.build_remux_command(part, final, settings), final)
-                else:
-                    _encode(source, final, aspect, settings, vertical_mode, x_offset, "aac")
-            except ffmpeg.FFmpegError as exc:
-                results.append(ExportResult(clip.id, aspect, error=str(exc)))
-                continue
-            if want_clips:
-                results.append(ExportResult(clip.id, aspect, output=final))
-        if want_montage:
-            dst = out_dir / montage_file_name(plan.meta.demo_name, aspect)
-            try:
-                results.append(_join(parts, dst, aspect, settings, say))
-            finally:
-                for part in parts:
-                    part.unlink(missing_ok=True)
-    _remove_empty_dir(parts_dir)
+    try:
+        _check(cancel)
+        sources = {clip.id: _load_recordings(recordings_dir, clip) for clip in plan.clips}
+        for aspect in aspects:
+            for clip in plan.clips:
+                _check(cancel)
+                done += 1
+                source = sources[clip.id]
+                if isinstance(source, str):
+                    results.append(ExportResult(clip.id, aspect, error=source))
+                    continue
+                say(f"Exporting {clip.id} {aspect} ({done}/{total})")
+                final = out_dir / clip_file_name(clip.id, aspect)
+                try:
+                    if want_montage:
+                        parts_dir.mkdir(exist_ok=True)
+                        part = parts_dir / f"{clip.id}_{aspect}.mov"
+                        parts.append(_encode(source, part, aspect, settings, vertical_mode, x_offset, "pcm", cancel))
+                        if want_clips:
+                            ffmpeg.run_to(ffmpeg.build_remux_command(part, final, settings), final, cancel)
+                    else:
+                        _encode(source, final, aspect, settings, vertical_mode, x_offset, "aac", cancel)
+                except ffmpeg.FFmpegCancelled:
+                    raise
+                except ffmpeg.FFmpegError as exc:
+                    results.append(ExportResult(clip.id, aspect, error=str(exc)))
+                    continue
+                if want_clips:
+                    results.append(ExportResult(clip.id, aspect, output=final))
+            if want_montage:
+                _check(cancel)
+                dst = out_dir / montage_file_name(plan.meta.demo_name, aspect)
+                try:
+                    results.append(_join(parts, dst, aspect, settings, say, cancel))
+                finally:
+                    _remove_files(parts)
+    except ffmpeg.FFmpegCancelled:
+        say("Export stopped. The videos finished so far are kept.")
+    finally:
+        _remove_files(parts)
+        _remove_empty_dir(parts_dir)
     return results
+
+
+def remove_recordings(recordings_dir: Path, clips: Iterable[Clip]) -> None:
+    """Delete every recorded piece of ``clips``, so a new capture never mixes with an old one."""
+    if not recordings_dir.is_dir():
+        return
+    ids = {clip.id for clip in clips}
+    for path in recordings_dir.iterdir():
+        owner = PIECE_SUFFIX.sub("", path.stem)
+        if (path.stem in ids or owner in ids) and path.suffix.lower() in VIDEO_EXTS and path.is_file():
+            path.unlink()
+
+
+def remove_old_outputs(out_dir: Path, demo_name: str, log: Callable[[str], None] | None = None) -> list[Path]:
+    """Delete the videos an earlier export left in ``out_dir``, and a leftover ``.parts`` folder.
+
+    Only clip files of planner clip ids (``clipNNN_rNN_<aspect>.mp4``) and the montages
+    of ``demo_name`` are removed; every other file stays. Returns the removed files.
+    """
+    if not out_dir.is_dir():
+        return []
+    say = log or _quiet
+    montages = {montage_file_name(demo_name, aspect) for aspect in get_args(Aspect)}
+    removed: list[Path] = []
+    for path in sorted(out_dir.iterdir()):
+        if not (path.name in montages or CLIP_FILE.fullmatch(path.name)) or not path.is_file():
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            say(f"Could not remove {path.name} from an earlier run: {exc}")
+            continue
+        removed.append(path)
+    shutil.rmtree(out_dir / PARTS_DIR, ignore_errors=True)
+    return removed
 
 
 def segment_count(clip: Clip) -> int:
@@ -137,6 +190,11 @@ def _quiet(_message: str) -> None:
     pass
 
 
+def _check(cancel: Event | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise ffmpeg.FFmpegCancelled("export cancelled")
+
+
 def _encode(
     recordings: list[Recording],
     dst: Path,
@@ -145,20 +203,28 @@ def _encode(
     vertical_mode: VerticalMode,
     x_offset: float,
     audio: ffmpeg.AudioCodec,
-) -> None:
+    cancel: Event | None = None,
+) -> Path:
     cmd = ffmpeg.build_join_command(recordings, dst, aspect, settings, vertical_mode, x_offset, audio=audio)
-    ffmpeg.run_to(cmd, dst)
+    return ffmpeg.run_to(cmd, dst, cancel)
 
 
 def _join(
-    parts: list[Path], dst: Path, aspect: Aspect, settings: EncodeSettings, say: Callable[[str], None]
+    parts: list[Path],
+    dst: Path,
+    aspect: Aspect,
+    settings: EncodeSettings,
+    say: Callable[[str], None],
+    cancel: Event | None = None,
 ) -> ExportResult:
     if not parts:
         return ExportResult(MONTAGE_ID, aspect, error="no clip could be exported, so there is no montage")
     say(f"Joining {len(parts)} clip{'s' if len(parts) != 1 else ''} into {dst.name}")
     list_file = ffmpeg.write_concat_list(parts, parts[0].parent / f"montage_{aspect}.txt")
     try:
-        ffmpeg.run_to(ffmpeg.build_concat_command(list_file, dst, settings), dst)
+        ffmpeg.run_to(ffmpeg.build_concat_command(list_file, dst, settings), dst, cancel)
+    except ffmpeg.FFmpegCancelled:
+        raise
     except ffmpeg.FFmpegError as exc:
         return ExportResult(MONTAGE_ID, aspect, error=str(exc))
     finally:
@@ -201,6 +267,12 @@ def _find_file(directory: Path, stem: str) -> Path | None:
     if not matches:
         return None
     return min(matches, key=lambda p: (VIDEO_EXTS.index(p.suffix.lower()), p.name))
+
+
+def _remove_files(paths: list[Path]) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
+    paths.clear()
 
 
 def _remove_empty_dir(path: Path) -> None:

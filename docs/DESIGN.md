@@ -178,6 +178,10 @@ Still unverified until the first run on Windows:
 - The HUD and kill-feed commands work in demo playback without `sv_cheats`.
 - A `-sw -w 2560 -h 1440` window records at full size on the user's monitor.
 - HLAE's FFmpeg closes each `video.mp4` before the app collects it.
+- Whether the boot cfg's cvars (`engine_no_focus_sleep 0`, the HUD telemetry lines,
+  `cl_draw_only_deathnotices 1`) stay set in normal play: nothing restores them, and the run
+  uses the user's own CS2 config (no `-afxDisableSteamStorage` or `USRLOCALCSGO` folder as
+  CS Demo Manager uses).
 
 First run checklist (Setup tab all green, then one short demo and one player):
 

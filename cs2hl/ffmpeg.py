@@ -9,6 +9,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Literal, Sequence
 
 Aspect = Literal["16x9", "9x16"]
@@ -18,10 +19,15 @@ AudioCodec = Literal["aac", "pcm"]  # pcm is for intermediate parts that are joi
 AUDIO_RATE = 48000
 # One mp4/mov timescale for every file we write, so parts always share a time base when joined.
 TIMESCALE = 90000
+POLL_S = 0.1  # how often a running ffmpeg looks at its cancel event
 
 
 class FFmpegError(RuntimeError):
     pass
+
+
+class FFmpegCancelled(FFmpegError):
+    """Raised by ``run`` when its cancel event is set. ffmpeg has been stopped by then."""
 
 
 def _no_window_flags() -> int:
@@ -307,32 +313,62 @@ def _reframe_graph(
     raise ValueError(f"unknown vertical_mode: {vertical_mode}")
 
 
-def run(cmd: list[str]) -> None:
+def run(cmd: list[str], cancel: Event | None = None) -> None:
+    """Run an ffmpeg command and wait for it.
+
+    A set ``cancel`` stops ffmpeg within about POLL_S seconds and raises FFmpegCancelled;
+    a set event before the start runs nothing.
+    """
     tool = find_tool(cmd[0])
     if tool is None:
         raise FFmpegError(f"{cmd[0]} not found. Install FFmpeg, or place {cmd[0]}.exe next to the app.")
-    result = subprocess.run(
+    if cancel is not None and cancel.is_set():
+        raise FFmpegCancelled(f"{cmd[0]} was not started: cancelled")
+    with subprocess.Popen(
         [tool, *cmd[1:]],
         stdin=subprocess.DEVNULL,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
         creationflags=_no_window_flags(),
-    )
-    if result.returncode != 0:
-        message = result.stderr.strip()[-2000:]
-        raise FFmpegError(message or f"{cmd[0]} exited with {result.returncode}")
+    ) as proc:
+        try:
+            stderr = _wait(proc, cancel, cmd[0])
+        except BaseException:
+            _stop(proc)
+            raise
+    if proc.returncode != 0:
+        message = stderr.strip()[-2000:]
+        raise FFmpegError(message or f"{cmd[0]} exited with {proc.returncode}")
 
 
-def run_to(cmd: list[str], dst: Path) -> Path:
-    """Run a command that writes ``dst``. A failed run leaves no partial file behind."""
+def run_to(cmd: list[str], dst: Path, cancel: Event | None = None) -> Path:
+    """Run a command that writes ``dst``. A failed or cancelled run leaves no partial file behind."""
     try:
-        run(cmd)
+        run(cmd, cancel=cancel)
     except FFmpegError:
         dst.unlink(missing_ok=True)
         raise
     return dst
+
+
+def _wait(proc: subprocess.Popen[str], cancel: Event | None, name: str) -> str:
+    """Wait for ``proc`` while reading its output, so a full pipe never blocks it. Returns stderr."""
+    while True:
+        try:
+            return proc.communicate(timeout=None if cancel is None else POLL_S)[1] or ""
+        except subprocess.TimeoutExpired:
+            if cancel is not None and cancel.is_set():
+                raise FFmpegCancelled(f"{name} was stopped: cancelled") from None
+
+
+def _stop(proc: subprocess.Popen[str]) -> None:
+    """Kill a running process at once; what it was writing is thrown away anyway."""
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
 
 
 def probe(path: Path) -> dict:

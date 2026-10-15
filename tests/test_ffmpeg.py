@@ -1,5 +1,7 @@
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -7,6 +9,7 @@ import pytest
 from cs2hl import ffmpeg
 from cs2hl.ffmpeg import (
     EncodeSettings,
+    FFmpegCancelled,
     FFmpegError,
     Recording,
     build_command,
@@ -205,3 +208,129 @@ def test_failed_run_leaves_no_partial_output(tmp_path):
     with pytest.raises(FFmpegError):
         ffmpeg.run_to(build_command(tmp_path / "missing.mp4", dst, "16x9"), dst)
     assert not dst.exists()
+
+
+def lavfi_command(dst: Path, seconds: int, realtime: bool) -> list[str]:
+    """Encode a test pattern. With ``realtime`` (-re) it takes ``seconds`` of wall time."""
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        *(["-re"] if realtime else []), "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate=30:duration={seconds}",
+        "-c:v", "libx264", "-preset", "ultrafast", "-f", "mpegts", str(dst),
+    ]
+
+
+@pytest.fixture
+def started(monkeypatch):
+    """Every process ffmpeg.run starts, so a test can check it is gone afterwards."""
+    procs: list[subprocess.Popen] = []
+
+    class Tracked(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            procs.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", Tracked)
+    return procs
+
+
+@needs_ffmpeg
+def test_cancel_kills_a_running_ffmpeg_quickly_and_removes_its_output(tmp_path, started):
+    dst = tmp_path / "slow.ts"
+    cancel = threading.Event()
+    seen: list[bool] = []
+
+    def press_cancel():
+        seen.append(dst.exists() and started[0].poll() is None)  # ffmpeg is running and writing
+        cancel.set()
+
+    timer = threading.Timer(1.5, press_cancel)
+    timer.start()
+    begin = time.monotonic()
+    try:
+        with pytest.raises(FFmpegCancelled, match="cancelled"):
+            ffmpeg.run_to(lavfi_command(dst, 60, realtime=True), dst, cancel)
+    finally:
+        timer.cancel()
+    stopped_after = time.monotonic() - begin - 1.5
+
+    assert seen == [True]
+    assert stopped_after < 3.0  # the encode alone would take 60 s
+    assert started[0].poll() is not None
+    assert not dst.exists()
+    assert isinstance(FFmpegCancelled("x"), FFmpegError)  # callers that catch FFmpegError still do
+
+
+@needs_ffmpeg
+def test_an_unset_cancel_event_lets_ffmpeg_finish(tmp_path):
+    dst = tmp_path / "short.ts"
+
+    ffmpeg.run_to(lavfi_command(dst, 1, realtime=False), dst, threading.Event())
+
+    assert dst.stat().st_size > 0
+
+
+def test_a_set_cancel_event_starts_nothing(tmp_path, monkeypatch):
+    def no_start(*args, **kwargs):
+        raise AssertionError("ffmpeg must not start")
+
+    monkeypatch.setattr(ffmpeg, "find_tool", lambda name: "/opt/ffmpeg")
+    monkeypatch.setattr(subprocess, "Popen", no_start)
+    dst = tmp_path / "out.mp4"
+    dst.write_bytes(b"old")
+    cancel = threading.Event()
+    cancel.set()
+
+    with pytest.raises(FFmpegCancelled):
+        ffmpeg.run_to(["ffmpeg", "-i", "x"], dst, cancel)
+    assert not dst.exists()
+
+
+class FakeProc:
+    """A finished ffmpeg as Popen returns it."""
+
+    def __init__(self, args: list[str], kwargs: dict, returncode: int, stderr: str):
+        self.args, self.kwargs = args, kwargs
+        self.returncode = returncode
+        self.stderr_text = stderr
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def communicate(self, timeout=None):
+        return "", self.stderr_text
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+@pytest.mark.parametrize("cancel", [None, threading.Event()])
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "message"),
+    [(1, "  in.mp4: No such file or directory\n", "in.mp4: No such file or directory"), (3, "", "ffmpeg exited with 3")],
+)
+def test_failed_run_reports_ffmpeg_errors_and_hides_the_console(monkeypatch, cancel, returncode, stderr, message):
+    procs: list[FakeProc] = []
+
+    def popen(args, **kwargs):
+        procs.append(FakeProc(args, kwargs, returncode, stderr))
+        return procs[-1]
+
+    monkeypatch.setattr(ffmpeg, "find_tool", lambda name: "/opt/ffmpeg")
+    monkeypatch.setattr(ffmpeg, "_no_window_flags", lambda: 0x08000000)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+    with pytest.raises(FFmpegError) as raised:
+        ffmpeg.run(["ffmpeg", "-i", "in.mp4", "out.mp4"], cancel=cancel)
+
+    assert str(raised.value) == message
+    assert not isinstance(raised.value, FFmpegCancelled)
+    [proc] = procs
+    assert proc.args == ["/opt/ffmpeg", "-i", "in.mp4", "out.mp4"]
+    assert proc.kwargs["creationflags"] == 0x08000000
+    assert proc.kwargs["stdin"] is subprocess.DEVNULL

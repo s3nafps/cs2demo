@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -13,9 +14,11 @@ from cs2hl.export import (
     export_plan,
     montage_file_name,
     recording_for,
+    remove_old_outputs,
+    remove_recordings,
     segment_files,
 )
-from cs2hl.ffmpeg import EncodeSettings, FFmpegError, Recording
+from cs2hl.ffmpeg import EncodeSettings, FFmpegCancelled, FFmpegError, Recording
 from cs2hl.models import Clip, DemoMeta, Plan
 
 needs_ffmpeg = pytest.mark.skipif(
@@ -334,32 +337,54 @@ def test_bad_arguments_are_rejected_before_any_work(recordings, tmp_path):
 
 
 class FakeFFmpeg:
-    """Stands in for ffmpeg: records each command, writes its output, can fail on demand."""
+    """Stands in for ffmpeg: records each command, writes its output, can fail on demand.
 
-    def __init__(self, fail_on: str | None = None):
+    cancel_after: set the cancel event once the output with this in its name is written.
+    killed_on: for that output, set the event and stop like a killed ffmpeg would.
+    """
+
+    def __init__(self, fail_on: str | None = None, cancel_after: str | None = None, killed_on: str | None = None):
         self.commands: list[list[str]] = []
+        self.cancels: list[Event | None] = []
         self.lists: list[str] = []
+        self.probed: list[Path] = []
         self.fail_on = fail_on
+        self.cancel_after = cancel_after
+        self.killed_on = killed_on
 
-    def __call__(self, cmd: list[str]) -> None:
+    def __call__(self, cmd: list[str], cancel: Event | None = None) -> None:
         self.commands.append(cmd)
+        self.cancels.append(cancel)
         dst = Path(cmd[-1])
         dst.write_bytes(b"partial")
         if "concat" in cmd:
             self.lists.append(Path(cmd[cmd.index("-i") + 1]).read_text(encoding="utf-8"))
         if self.fail_on and self.fail_on in dst.name:
             raise FFmpegError("encoder exploded")
+        if cancel is not None and self.killed_on and self.killed_on in dst.name:
+            cancel.set()
+            raise FFmpegCancelled("ffmpeg was stopped: cancelled")
+        if cancel is not None and self.cancel_after and self.cancel_after in dst.name:
+            cancel.set()
+
+    def probe(self, path: Path) -> Recording:
+        self.probed.append(path)
+        return Recording(path, 1.0, True)
 
 
 @pytest.fixture
 def fake(monkeypatch, recordings):
-    def install(fail_on: str | None = None) -> FakeFFmpeg:
-        runner = FakeFFmpeg(fail_on)
+    def install(**kwargs) -> FakeFFmpeg:
+        runner = FakeFFmpeg(**kwargs)
         monkeypatch.setattr(ffmpeg, "run", runner)
-        monkeypatch.setattr(ffmpeg, "probe_recording", lambda path: Recording(path, 1.0, True))
+        monkeypatch.setattr(ffmpeg, "probe_recording", runner.probe)
         return runner
 
     return install
+
+
+def outputs(folder: Path) -> list[str]:
+    return sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*"))
 
 
 def test_progress_lines_and_plan_order(fake, recordings, tmp_path):
@@ -425,3 +450,155 @@ def test_clips_mode_encodes_straight_to_mp4(fake, recordings, tmp_path):
     [cmd] = runner.commands
     assert cmd[cmd.index("-c:a") + 1] == "aac"
     assert not (tmp_path / "out" / PARTS_DIR).exists()
+
+
+def test_cancel_stops_before_the_next_encode(fake, recordings, tmp_path):
+    runner = fake(cancel_after="a_16x9")
+    for name in ("a_s0.mp4", "b_s0.mp4", "c_s0.mp4"):
+        (recordings / name).write_bytes(b"")
+    cancel = Event()
+    lines: list[str] = []
+    out = tmp_path / "out"
+
+    results = export_plan(
+        Plan(META, [clip("a"), clip("b"), clip("c")]), recordings, out, ["16x9", "9x16"], log=lines.append, cancel=cancel
+    )
+
+    assert [(r.clip_id, r.aspect, r.error) for r in results] == [("a", "16x9", None)]
+    assert len(runner.commands) == 1
+    assert runner.cancels == [cancel]
+    assert lines == ["Exporting a 16x9 (1/6)", "Export stopped. The videos finished so far are kept."]
+    assert outputs(out) == ["a_16x9.mp4"]
+
+
+def test_cancel_during_an_encode_keeps_finished_clips_and_removes_partial_files(fake, recordings, tmp_path):
+    runner = fake(killed_on="b_16x9")
+    for name in ("a_s0.mp4", "b_s0.mp4", "c_s0.mp4"):
+        (recordings / name).write_bytes(b"")
+    out = tmp_path / "out"
+
+    results = export_plan(
+        Plan(META, [clip("a"), clip("b"), clip("c")]), recordings, out, ["16x9"], output="both", cancel=Event()
+    )
+
+    assert [(r.clip_id, r.output) for r in results] == [("a", out / "a_16x9.mp4")]
+    # a: part + remux, b: its part was being encoded when ffmpeg was stopped
+    assert [Path(cmd[-1]).name for cmd in runner.commands] == ["a_16x9.mov", "a_16x9.mp4", "b_16x9.mov"]
+    assert runner.lists == []  # no montage join
+    assert outputs(out) == ["a_16x9.mp4"]  # no .parts, no partial b
+    assert sorted(p.name for p in recordings.iterdir()) == ["a_s0.mp4", "b_s0.mp4", "c_s0.mp4"]
+
+
+def test_cancel_during_the_join_removes_the_partial_montage(fake, recordings, tmp_path):
+    runner = fake(killed_on="highlights_16x9")
+    for name in ("a_s0.mp4", "b_s0.mp4"):
+        (recordings / name).write_bytes(b"")
+    out = tmp_path / "out"
+
+    results = export_plan(Plan(META, [clip("a"), clip("b")]), recordings, out, ["16x9", "9x16"], output="montage", cancel=Event())
+
+    assert results == []
+    assert len(runner.lists) == 1
+    assert outputs(out) == []
+
+
+def test_cancel_after_the_last_encode_skips_the_join(fake, recordings, tmp_path):
+    runner = fake(cancel_after="b_16x9")
+    for name in ("a_s0.mp4", "b_s0.mp4"):
+        (recordings / name).write_bytes(b"")
+    out = tmp_path / "out"
+
+    results = export_plan(Plan(META, [clip("a"), clip("b")]), recordings, out, ["16x9"], output="montage", cancel=Event())
+
+    assert results == []
+    assert [Path(cmd[-1]).name for cmd in runner.commands] == ["a_16x9.mov", "b_16x9.mov"]
+    assert outputs(out) == []
+
+
+def test_a_finished_montage_survives_a_cancel_in_the_next_aspect(fake, recordings, tmp_path):
+    fake(killed_on="a_9x16")
+    (recordings / "a_s0.mp4").write_bytes(b"")
+    out = tmp_path / "out"
+
+    results = export_plan(Plan(META, [clip("a")]), recordings, out, ["16x9", "9x16"], output="montage", cancel=Event())
+
+    assert [(r.clip_id, r.aspect, r.output) for r in results] == [(MONTAGE_ID, "16x9", out / "match_highlights_16x9.mp4")]
+    assert outputs(out) == ["match_highlights_16x9.mp4"]
+
+
+def test_a_cancel_set_before_the_export_does_no_work(fake, recordings, tmp_path):
+    runner = fake()
+    (recordings / "a_s0.mp4").write_bytes(b"")
+    cancel = Event()
+    cancel.set()
+
+    results = export_plan(Plan(META, [clip("a")]), recordings, tmp_path / "out", ["16x9"], output="both", cancel=cancel)
+
+    assert results == []
+    assert runner.commands == [] and runner.probed == []
+
+
+def test_a_failed_encode_stays_an_error_when_a_cancel_event_is_given(fake, recordings, tmp_path):
+    fake(fail_on="a_16x9")
+    (recordings / "a_s0.mp4").write_bytes(b"")
+
+    [result] = export_plan(Plan(META, [clip("a")]), recordings, tmp_path / "out", ["16x9"], cancel=Event())
+
+    assert result.error == "encoder exploded"
+
+
+def test_remove_old_outputs_only_touches_files_this_app_wrote(tmp_path):
+    out = tmp_path / "out"
+    (out / PARTS_DIR).mkdir(parents=True)
+    (out / PARTS_DIR / "clip001_r01_16x9.mov").write_bytes(b"")
+    (out / "recordings").mkdir()
+    (out / "recordings" / "clip001_r01_s0.mp4").write_bytes(b"")
+    old = [
+        "clip001_r01_16x9.mp4",
+        "clip012_r24_9x16.mp4",
+        "clip1000_r05_16x9.mp4",
+        "match_highlights_16x9.mp4",
+        "match_highlights_9x16.mp4",
+    ]
+    kept = [
+        "notes.txt",
+        "clip001_r01_16x9.mp4.txt",
+        "clip001_r01_4x3.mp4",
+        "clip1_16x9.mp4",
+        "my clip001_r01_16x9.mp4",
+        "clip001_r01_16x9.mkv",
+        "other_highlights_16x9.mp4",
+        "match_highlights_16x9.mov",
+        "match.mp4",
+    ]
+    for name in old + kept:
+        (out / name).write_bytes(b"")
+    (out / "clip002_r03_16x9.mp4").mkdir()  # not a file: left alone
+    lines: list[str] = []
+
+    removed = remove_old_outputs(out, "match.dem", lines.append)
+
+    assert sorted(p.name for p in removed) == sorted(old)
+    assert outputs(out) == sorted(["clip002_r03_16x9.mp4", "recordings", "recordings/clip001_r01_s0.mp4", *kept])
+    assert lines == []
+    assert remove_old_outputs(tmp_path / "missing", "match.dem") == []
+
+
+def test_remove_recordings_drops_only_the_pieces_of_the_given_clips(recordings):
+    names = [
+        "clip001_r01_s0.mp4",
+        "clip001_r01_s1.mkv",
+        "clip001_r01.mp4",
+        "clip002_r01_s0.mp4",
+        "clip001_r01_s0.mp4.part",
+        "clip001_r01_s0-muxing.mp4",
+        "clip001_r01_extra.mp4",
+        "notes.txt",
+    ]
+    for name in names:
+        (recordings / name).write_bytes(b"")
+
+    remove_recordings(recordings, [clip("clip001_r01", pieces=2)])
+
+    assert sorted(p.name for p in recordings.iterdir()) == sorted(names[3:])
+    remove_recordings(recordings / "missing", [clip("clip001_r01")])

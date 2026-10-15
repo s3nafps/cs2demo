@@ -6,13 +6,16 @@ followed by process name, as CS Demo Manager does.
 
 from __future__ import annotations
 
+import codecs
 import configparser
+import functools
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from threading import Event
-from typing import Callable, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 import psutil
 
@@ -21,6 +24,9 @@ HOOK_DLL = Path("x64") / "AfxHookSource2.dll"
 INJECTOR = Path("x64") / "injector.exe"
 # AfxHookSource2 reports hook failures in a MessageBox with this title (AfxHookSource2/Globals.cpp).
 HOOK_ERROR_TITLE = "Error - AfxHookSource"
+
+# GetPrivateProfileStringW reads a file without a UTF-16 BOM in the ANSI code page.
+ANSI_CODEC = "mbcs" if sys.platform == "win32" else "cp1252"
 
 WaitOutcome = Literal["done", "timeout", "cancelled", "aborted"]
 
@@ -84,18 +90,11 @@ def hlae_ffmpeg_path(hlae_exe: Path) -> Path | None:
 
 
 def _ini_value(path: Path, section: str, key: str) -> str:
-    """Read one value like GetPrivateProfileString: section and key ignore case, quotes are stripped."""
+    """Read one value like GetPrivateProfileStringW: section and key ignore case, quotes are stripped."""
     try:
-        raw = path.read_bytes()
+        text = decode_ini(path.read_bytes())
     except OSError:
         return ""
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        text = raw.decode("utf-16", errors="replace")
-    else:
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("cp1252", errors="replace")  # WritePrivateProfileStringA writes the ANSI code page
     ini = configparser.ConfigParser(interpolation=None, strict=False)
     try:
         ini.read_string(text)
@@ -107,16 +106,62 @@ def _ini_value(path: Path, section: str, key: str) -> str:
     return ini.get(name, key, fallback="").strip().strip('"').strip()
 
 
+def decode_ini(raw: bytes) -> str:
+    """Text of an ini file as Windows reads it: UTF-16 or UTF-8 with a BOM, else the ANSI code page.
+
+    A UTF-8 file without a BOM (what older cs2hl and CS Demo Manager write) therefore reads
+    a non-ASCII path the way HLAE does: garbled, so it is not taken as a working FFmpeg.
+    """
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16", errors="replace")
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw[len(codecs.BOM_UTF8):].decode("utf-8", errors="replace")
+    return raw.decode(ANSI_CODEC, errors="replace")
+
+
 def hlae_has_ffmpeg(hlae_exe: Path) -> bool:
     return hlae_ffmpeg_path(hlae_exe) is not None
 
 
 def register_hlae_ffmpeg(hlae_exe: Path, ffmpeg_exe: Path) -> Path:
-    """Point HLAE at ``ffmpeg_exe`` by writing ffmpeg\\ffmpeg.ini, as CS Demo Manager does. Returns the ini."""
+    """Point HLAE at ``ffmpeg_exe`` by writing ffmpeg\\ffmpeg.ini, as CS Demo Manager does. Returns the ini.
+
+    Written as UTF-16 LE with a BOM: the only encoding in which GetPrivateProfileStringW
+    reads a non-ASCII path (a user folder like C:\\Users\\José) correctly.
+    """
     ini = hlae_ffmpeg_ini(hlae_exe)
     ini.parent.mkdir(parents=True, exist_ok=True)
-    ini.write_text(f"[Ffmpeg]\nPath={ffmpeg_exe}\n", encoding="utf-8")
+    ini.write_bytes(codecs.BOM_UTF16_LE + f"[Ffmpeg]\r\nPath={ffmpeg_exe}\r\n".encode("utf-16-le"))
     return ini
+
+
+def can_register_hlae_ffmpeg(hlae_exe: Path) -> bool:
+    """True when ffmpeg\\ffmpeg.ini next to HLAE can be written (the HLAE installer uses Program Files).
+
+    Probes with a temporary file and removes whatever it created.
+    """
+    ini = hlae_ffmpeg_ini(hlae_exe)
+    folder = ini.parent
+    created = False
+    try:
+        if not folder.is_dir():
+            folder.mkdir()
+            created = True
+        if ini.exists():
+            with open(ini, "ab"):
+                pass
+        else:
+            with tempfile.TemporaryFile(dir=folder):
+                pass
+        return True
+    except OSError:
+        return False
+    finally:
+        if created:
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
 
 
 def find_processes(name: str) -> list[psutil.Process]:
@@ -185,30 +230,69 @@ def wait_for_exit(
 
 
 def window_title_exists(prefix: str) -> bool:
-    """True when a visible top-level window title starts with ``prefix``. Always False off Windows."""
+    """True when a visible top-level window title starts with ``prefix``. Always False off Windows.
+
+    Written from the Win32 docs; not run on Windows yet.
+    """
     if sys.platform != "win32":
         return False
-    # Win32 EnumWindows via ctypes; written from the API docs and not run yet.
+    user32, proc_type = _user32()
+    return any_window_title(user32, proc_type, prefix)
+
+
+def any_window_title(user32: Any, proc_type: Callable[[Callable[[Any, Any], bool]], Any], prefix: str) -> bool:
+    """Walk every top-level window with ``user32.EnumWindows`` and look for a visible title."""
+    found: list[bool] = []
+
+    def visit(hwnd: Any, _lparam: Any) -> bool:
+        try:
+            title = _visible_title(user32, hwnd)
+            if title is not None and title.startswith(prefix):
+                found.append(True)
+        except Exception:
+            pass
+        return True  # False, or an exception escaping into ctypes, would end EnumWindows early
+
+    callback = proc_type(visit)
+    user32.EnumWindows(callback, 0)
+    return bool(found)
+
+
+def _visible_title(user32: Any, hwnd: Any) -> str | None:
+    import ctypes
+
+    if not user32.IsWindowVisible(hwnd):
+        return None
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return None
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+@functools.cache
+def _user32() -> tuple[Any, Any]:
+    """user32 with argtypes and restype declared, so 64-bit handles are not cut to C ints."""
     import ctypes
     from ctypes import wintypes
 
-    user32 = ctypes.windll.user32
-    found = False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)  # its own copy, not the shared ctypes.windll one
+    proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    declare_user32(user32, proc_type)
+    return user32, proc_type
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def visit(hwnd, _lparam):
-        nonlocal found
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        if buf.value.startswith(prefix):
-            found = True
-            return False
-        return True
 
-    user32.EnumWindows(visit, 0)
-    return found
+def declare_user32(user32: Any, proc_type: Any) -> None:
+    """Signatures of EnumWindows, IsWindowVisible, GetWindowTextLengthW and GetWindowTextW."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32.EnumWindows.argtypes = (proc_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.GetWindowTextW.restype = ctypes.c_int

@@ -99,6 +99,7 @@ def parse_with(parser: Any, demo_name: str) -> ParsedDemo:
         player_names=names,
         player_slots=slots,
         warnings=tuple(warnings),
+        deaths=tuple(tally.round_deaths),
     )
     return ParsedDemo(data=data, scoreboard=scoreboard, exit_kills=tuple(tally.exit_kills))
 
@@ -297,15 +298,17 @@ def _slots(states: States, rounds: list[Round]) -> tuple[dict[int, int], list[st
 class _Tally:
     kills: list[Kill] = field(default_factory=list)  # enemy kills inside rounds
     exit_kills: list[Kill] = field(default_factory=list)  # enemy kills after round_end
+    round_deaths: list[tuple[int, int, int]] = field(default_factory=list)  # (tick, round, victim) inside rounds
     deaths: dict[int, int] = field(default_factory=dict)
     team_kills: dict[int, int] = field(default_factory=dict)
 
 
 def _tally(death_df: Any, rounds: list[Round], rosters: Rosters, last_tick: int | None) -> _Tally:
-    """Sort player_death rows into in-round kills, exit kills and scoreboard deaths.
+    """Sort player_death rows into in-round kills, exit kills, in-round deaths and scoreboard deaths.
 
     Deaths before the first round are warmup. After the last round, deaths count only up
-    to ``last_tick`` (the match win panel), as the game's counters do.
+    to ``last_tick`` (the match win panel), as the game's counters do. In-round deaths
+    keep world damage, suicides and team kills, which leave a player dead without a kill.
     """
     tally = _Tally()
     death_df = _frame(death_df)
@@ -324,6 +327,8 @@ def _tally(death_df: Any, rounds: list[Round], rosters: Rosters, last_tick: int 
 
         attacker = _int(row.get("attacker_steamid"))
         victim = _int(row.get("user_steamid"))
+        if in_round:
+            tally.round_deaths.append((tick, rnd.number, victim))
         if victim:
             tally.deaths[victim] = tally.deaths.get(victim, 0) + 1
         if attacker == 0 or attacker == victim:

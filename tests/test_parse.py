@@ -242,7 +242,7 @@ def test_missing_events_come_back_as_lists_and_are_treated_as_empty():
     data = parse.parse_with(fake, "match.dem").data
 
     assert len(data.rounds) == 2
-    assert data.kills == []
+    assert data.kills == [] and data.deaths == ()
 
 
 def test_demo_without_round_end_has_no_rounds_and_says_so():
@@ -303,6 +303,23 @@ def test_kills_inside_rounds_drop_warmup_knife_team_kills_and_world_damage():
     assert first.headshot and first.through_smoke and not first.wallbang
     assert second.weapon == "knife" and second.wallbang
     assert fourth.noscope and fourth.attacker_side == "CT"
+
+
+def test_every_in_round_death_is_kept_for_who_is_alive():
+    data = parse.parse_with(build_fake(), "match.dem").data
+
+    # Team kill (1150) and world damage (3700, 3800) are deaths without a kill. Knife round,
+    # warmup, the exit kill and everything after the last round end are left out.
+    assert data.deaths == (
+        (1000, 1, CARL),
+        (1100, 1, BRAVO),
+        (1150, 1, ECHO),
+        (1300, 1, DAVE),
+        (3500, 2, ALPHA),
+        (3700, 2, ECHO),
+        (3800, 2, BRAVO),
+    )
+    assert {(k.tick, k.victim_steamid) for k in data.kills} <= {(t, v) for t, _, v in data.deaths}
 
 
 def test_exit_kills_are_kept_apart_from_round_kills():

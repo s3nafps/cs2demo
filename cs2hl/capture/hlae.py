@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Callable
+from typing import Callable, Mapping
 
 from .. import ffmpeg
 from ..models import Clip, Plan
@@ -53,6 +53,8 @@ BOOT_CFG = "cs2hl_boot"  # exec reads game\csgo\cfg\<name>.cfg
 RECORD_ROOT = r"..\..\csgo"
 CS2_PROCESS = "cs2.exe"
 STEAM_PROCESSES = ("steam.exe", "steamchina.exe")
+# Set by -addEnv for CS2 and removed from HLAE's own environment, which HLAE passes on first.
+STEAM_ENV_KEYS = ("SteamPath", "SteamClientLaunch", "SteamGameId", "SteamAppId", "SteamOverlayGameId")
 VIDEO_NAME = "video.mp4"
 CLAIMED_VIDEO_NAME = "video.cs2hl.mp4"  # renamed before use; the rename fails on Windows while ffmpeg writes
 AUDIO_NAME = "audio.wav"  # startMovieWav output, redirected into the take folder (AfxHookSource2/main.cpp)
@@ -70,6 +72,7 @@ HLAE_START_TIMEOUT_S = 90.0  # HLAE.exe exits about 2 s after injecting; longer 
 CS2_START_TIMEOUT_S = 60.0
 FIRST_TAKE_TIMEOUT_S = 300.0  # no take folder this long after CS2 started: the boot cfg did not run
 IDLE_AFTER_LAST_S = 60.0  # every take written and none growing, but CS2 did not quit
+STALL_AFTER_S = 240.0  # takes missing and none appeared or grew this long: CS2 hangs (gaps are seconds)
 SETTLE_TIMEOUT_S = 120.0
 MISSING_POLLS = 3  # polls after CS2 exited before a missing or empty take counts as failed
 SHORT_RATIO = 0.5  # a segment shorter than this share of its length was cut off
@@ -144,6 +147,18 @@ def steam_env(steam_dir: Path | None) -> list[str]:
     """Environment of a Steam-client launch, as HLAE's CS2 launcher sets it (LaunchCs2.cs)."""
     env = [] if steam_dir is None else [f"SteamPath={steam_dir}"]
     return env + ["SteamClientLaunch=1", "SteamGameId=730", "SteamAppId=730", "SteamOverlayGameId=730"]
+
+
+def hlae_process_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The app's environment without the Steam variables that -addEnv sets.
+
+    HLAE copies its own environment and appends the -addEnv lines after it (Program.cs),
+    so an inherited SteamAppId (the app started from Steam as a non-Steam game) would win
+    over 730. Windows names ignore case.
+    """
+    base = os.environ if base is None else base
+    drop = {key.lower() for key in STEAM_ENV_KEYS}
+    return {key: value for key, value in base.items() if key.lower() not in drop}
 
 
 def hlae_launch_args(hlae_exe: Path, cs2_exe: Path, cmd_line: str, steam_dir: Path | None = None) -> list[str]:
@@ -363,7 +378,7 @@ def _token(value: str, what: str) -> str:
 
 
 class _SessionWatch:
-    """Ends the wait for cs2.exe early: a hook error box, no take at all, or every take done but no quit."""
+    """Ends the wait for cs2.exe early: a hook error box, no take at all, a stall, or every take done but no quit."""
 
     def __init__(
         self,
@@ -371,14 +386,16 @@ class _SessionWatch:
         clock: Callable[[], float] = time.monotonic,
         first_take_s: float | None = None,
         idle_s: float | None = None,
+        stall_s: float | None = None,
     ) -> None:
         self.work_dirs = work_dirs
         self.clock = clock
         self.first_take_s = FIRST_TAKE_TIMEOUT_S if first_take_s is None else first_take_s
         self.idle_s = IDLE_AFTER_LAST_S if idle_s is None else idle_s
+        self.stall_s = STALL_AFTER_S if stall_s is None else stall_s
         self.started = clock()
         self.last_change = self.started
-        self.sizes: tuple[int, ...] = ()
+        self.state: tuple[tuple[int, int], ...] = ()
         self.reason: str | None = None
 
     def __call__(self) -> bool:
@@ -389,15 +406,20 @@ class _SessionWatch:
         now = self.clock()
         if tools.window_title_exists(tools.HOOK_ERROR_TITLE):
             return "hook-error"
-        if not any(any(p.is_dir() for p in d.glob("take*")) for d in self.work_dirs):
+        takes = [sum(1 for p in d.glob("take*") if p.is_dir()) for d in self.work_dirs]
+        if not any(takes):
             return "no-start" if now - self.started > self.first_take_s else None
         videos = [take_files(d)[0] for d in self.work_dirs]
-        sizes = tuple(_size(v) for v in videos)
-        if sizes != self.sizes:
-            self.sizes, self.last_change = sizes, now
-        if all(v is not None for v in videos) and now - self.last_change >= self.idle_s:
-            return "finished"
-        return None
+        state = tuple(zip(takes, (_size(v) for v in videos)))
+        if state != self.state:
+            self.state, self.last_change = state, now  # a take appeared or grew
+        idle = now - self.last_change
+        if all(v is not None for v in videos):
+            return "finished" if idle >= self.idle_s else None
+        return "stalled" if idle >= self.stall_s else None
+
+    def message(self) -> str:
+        return WATCH_MESSAGES[self.reason or "no-start"].format(first_take_s=self.first_take_s, stall_s=self.stall_s)
 
 
 def _size(path: Path | None) -> int:
@@ -412,6 +434,8 @@ WATCH_MESSAGES = {
     "HLAE may need an update after a CS2 update.",
     "no-start": "CS2 started but nothing was recorded within {first_take_s:g} s. "
     "The start script probably did not run; check the CS2 console.",
+    "stalled": "CS2 stopped recording: nothing new was written for {stall_s:g} s while some highlights "
+    "were still to come. CS2 probably froze or shows an error; it was closed.",
 }
 
 
@@ -501,7 +525,10 @@ class HlaeBackend:
         try:
             ini = tools.register_hlae_ffmpeg(cfg.hlae_exe, Path(app_ffmpeg))
         except OSError as exc:
-            raise CaptureError(f"HLAE has no FFmpeg and its folder is not writable: {exc}") from exc
+            raise CaptureError(
+                f"HLAE has no FFmpeg and cs2hl cannot write to its folder ({exc}). Copy ffmpeg.exe into "
+                f"{cfg.hlae_exe.parent / 'ffmpeg' / 'bin'} as administrator, or install HLAE in a folder you own."
+            ) from exc
         log(f"HLAE had no FFmpeg; pointed it at {app_ffmpeg} ({ini}).")
 
     def _record_session(
@@ -556,7 +583,7 @@ class HlaeBackend:
             if watch.reason == "finished":
                 log("Every segment is written but CS2 did not quit; closed it.")
             else:
-                reason = stop = WATCH_MESSAGES[watch.reason or "no-start"].format(first_take_s=watch.first_take_s)
+                reason = stop = watch.message()
                 log(reason)
         else:
             log("CS2 closed. Collecting the recordings.")
@@ -587,7 +614,7 @@ class HlaeBackend:
 
         log("Starting CS2 through HLAE.")
         try:
-            proc = start_process(args)
+            proc = start_process(args, hlae_process_env())
         except OSError as exc:
             return f"could not start {cfg.hlae_exe.name}: {exc}"
         outcome = tools.wait_until(lambda: proc.poll() is not None, cancel, HLAE_START_TIMEOUT_S, cfg.poll_interval_s)
@@ -720,8 +747,10 @@ def _length_problem(path: Path, expected_s: float, log: Callable[[str], None]) -
     return None
 
 
-def start_process(args: list[str]) -> subprocess.Popen:
-    return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def start_process(args: list[str], env: Mapping[str, str] | None = None) -> subprocess.Popen:
+    return subprocess.Popen(
+        args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+    )
 
 
 def _kill(proc: subprocess.Popen) -> None:

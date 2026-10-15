@@ -8,6 +8,7 @@ the models in ``cs2hl.models``, so they are unit-testable without a demo file.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from . import scoring
@@ -15,6 +16,9 @@ from .models import Highlight, Kill, Rosters, Round, Side
 
 OTHER_SIDE: dict[Side, Side] = {"T": "CT", "CT": "T"}
 SIDES: tuple[Side, Side] = ("T", "CT")
+
+# (tick, round_num, victim_steamid), as in DemoData.deaths
+Death = tuple[int, int, int]
 
 
 @dataclass(frozen=True)
@@ -36,12 +40,17 @@ def detect_highlights(
     kills: list[Kill],
     rosters: Rosters,
     cfg: DetectConfig | None = None,
+    deaths: Iterable[Death] = (),
 ) -> list[Highlight]:
+    """``deaths`` (``DemoData.deaths``) tells clutches who is alive; without it only kill victims die."""
     cfg = cfg or DetectConfig()
 
     kills_by_round: dict[int, list[Kill]] = defaultdict(list)
     for kill in sorted(kills, key=lambda k: k.tick):
         kills_by_round[kill.round_num].append(kill)
+    deaths_by_round: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for tick, round_num, victim in deaths:
+        deaths_by_round[round_num].append((tick, victim))
 
     found: list[Highlight] = []
     for rnd in rounds:
@@ -49,7 +58,9 @@ def detect_highlights(
         if not round_kills:
             continue
         roster = rosters.get(rnd.number, {})
-        clutch = find_clutch(rnd, round_kills, roster) if cfg.include_clutches else None
+        clutch = None
+        if cfg.include_clutches:
+            clutch = find_clutch(rnd, round_kills, roster, deaths_by_round.get(rnd.number, ()))
 
         by_player: dict[int, list[Kill]] = defaultdict(list)
         for kill in round_kills:
@@ -88,10 +99,31 @@ def highlight_label(kills: int, clutch_enemies: int = 0) -> str:
     return " + ".join(parts)
 
 
-def find_clutch(rnd: Round, round_kills: list[Kill], roster: dict[int, Side]) -> Clutch | None:
+def deaths_by_tick(
+    rnd: Round, round_kills: list[Kill], round_deaths: Iterable[tuple[int, int]] = ()
+) -> list[tuple[int, set[int]]]:
+    """Who dies at each tick of the round, from ``(tick, victim)`` deaths plus every kill's victim.
+
+    Deaths cover world damage, suicides and team kills; the kill victims keep this working
+    when a caller has no deaths.
+    """
+    dead: dict[int, set[int]] = defaultdict(set)
+    for tick, victim in [*round_deaths, *((k.tick, k.victim_steamid) for k in round_kills)]:
+        if rnd.start_tick <= tick <= rnd.end_tick:
+            dead[tick].add(victim)
+    return sorted(dead.items())
+
+
+def find_clutch(
+    rnd: Round,
+    round_kills: list[Kill],
+    roster: dict[int, Side],
+    round_deaths: Iterable[tuple[int, int]] = (),
+) -> Clutch | None:
     """A player left alone against N enemies whose side wins the round, with a kill after that.
 
-    Only the winning side can clutch, so a round has at most one.
+    ``round_deaths`` are this round's ``(tick, victim)`` deaths of any cause. Players who die
+    at the same tick leave together. Only the winning side can clutch, so a round has at most one.
     """
     if rnd.winner_side is None or not roster:
         return None
@@ -110,15 +142,16 @@ def find_clutch(rnd: Round, round_kills: list[Kill], roster: dict[int, Side]) ->
 
     # A side can already be down to one player when the round starts (disconnects).
     note_lone_players(rnd.start_tick)
-    for kill in round_kills:
-        alive.pop(kill.victim_steamid, None)
-        note_lone_players(kill.tick)
+    for tick, victims in deaths_by_tick(rnd, round_kills, round_deaths):
+        for victim in victims:
+            alive.pop(victim, None)
+        note_lone_players(tick)
 
     clutch = lone.get(rnd.winner_side)
     if clutch is None:
         return None
     player, since = clutch.player_steamid, clutch.since_tick
-    if not any(k.attacker_steamid == player and k.tick >= since for k in round_kills):
+    if not any(k.attacker_steamid == player and k.tick >= since and is_enemy_kill(k, roster) for k in round_kills):
         return None
     return clutch
 

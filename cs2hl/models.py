@@ -97,3 +97,6 @@ class DemoData:
     player_names: dict[int, str]
     player_slots: dict[int, int] = field(default_factory=dict)  # steamid -> spectator slot
     warnings: tuple[str, ...] = ()  # where the parse disagrees with the game's own counters
+    # (tick, round_num, victim_steamid) for every in-round death, world, suicide and team kill
+    # deaths included. Who is still alive comes from these; ``kills`` only has enemy kills.
+    deaths: tuple[tuple[int, int, int], ...] = ()

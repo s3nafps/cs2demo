@@ -26,7 +26,7 @@ class Check:
 
 
 def preflight(cs2_dir: Path | None, hlae_exe: Path | None) -> list[Check]:
-    """Windows, Steam, CS2, HLAE and FFmpeg checks, in the order a user should fix them."""
+    """Windows, Steam, CS2, HLAE, FFmpeg and FFprobe checks, in the order a user should fix them."""
     return [
         _windows(),
         _steam_running(),
@@ -35,6 +35,7 @@ def preflight(cs2_dir: Path | None, hlae_exe: Path | None) -> list[Check]:
         _hlae_found(hlae_exe),
         _hlae_ffmpeg(hlae_exe),
         _app_ffmpeg(),
+        _app_ffprobe(),
     ]
 
 
@@ -95,11 +96,19 @@ def _hlae_ffmpeg(hlae_exe: Path | None) -> Check:
     own = tools.hlae_ffmpeg_path(hlae_exe)
     if own is not None:
         return Check("HLAE FFmpeg", True, str(own))
-    app = ffmpeg.find_tool("ffmpeg")
-    if app is not None:
-        return Check("HLAE FFmpeg", True, f"HLAE has none; cs2hl will point it at {app} when recording.")
     folder = hlae_exe.parent / "ffmpeg" / "bin"
-    return Check("HLAE FFmpeg", False, f"HLAE records through FFmpeg. Put ffmpeg.exe in {folder}.")
+    app = ffmpeg.find_tool("ffmpeg")
+    if app is None:
+        return Check("HLAE FFmpeg", False, f"HLAE records through FFmpeg. Put ffmpeg.exe in {folder}.")
+    if not tools.can_register_hlae_ffmpeg(hlae_exe):
+        return Check(
+            "HLAE FFmpeg",
+            False,
+            f"HLAE has no FFmpeg and cs2hl cannot write to {folder.parent} (a protected folder such as "
+            f"Program Files). Copy ffmpeg.exe into {folder} as administrator, or install HLAE in a folder "
+            "you own and choose it in the Setup tab.",
+        )
+    return Check("HLAE FFmpeg", True, f"HLAE has none; cs2hl will point it at {app} when recording.")
 
 
 def _app_ffmpeg() -> Check:
@@ -107,3 +116,10 @@ def _app_ffmpeg() -> Check:
     if found is not None:
         return Check("FFmpeg", True, found)
     return Check("FFmpeg", False, "ffmpeg.exe was not found next to the app or on PATH.")
+
+
+def _app_ffprobe() -> Check:
+    found = ffmpeg.find_tool("ffprobe")
+    if found is not None:
+        return Check("FFprobe", True, found)
+    return Check("FFprobe", False, "ffprobe.exe was not found next to the app or on PATH. Export needs it; reinstall the app.")

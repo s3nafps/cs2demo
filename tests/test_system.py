@@ -1,6 +1,10 @@
+import codecs
+import ctypes
 import sys
+from ctypes import wintypes
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -292,8 +296,73 @@ def test_register_hlae_ffmpeg_is_read_back(tmp_path):
     app_ffmpeg.write_bytes(b"MZ")
     ini = tools.register_hlae_ffmpeg(exe, app_ffmpeg)
     assert ini == tmp_path / "HLAE" / "ffmpeg" / "ffmpeg.ini"
-    assert ini.read_text(encoding="utf-8") == f"[Ffmpeg]\nPath={app_ffmpeg}\n"
+    raw = ini.read_bytes()
+    assert raw.startswith(codecs.BOM_UTF16_LE)  # GetPrivateProfileStringW reads it as Unicode only with this BOM
+    assert raw[2:].decode("utf-16-le") == f"[Ffmpeg]\r\nPath={app_ffmpeg}\r\n"
     assert tools.hlae_ffmpeg_path(exe) == app_ffmpeg
+
+
+def test_register_hlae_ffmpeg_round_trips_a_non_ascii_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "ANSI_CODEC", "cp1252")
+    exe = make_hlae(tmp_path / "HLAE")
+    app_ffmpeg = tmp_path / "Users" / "José Łukasz" / "AppData" / "cs2hl" / "ffmpeg.exe"
+    app_ffmpeg.parent.mkdir(parents=True)
+    app_ffmpeg.write_bytes(b"MZ")
+    ini = tools.register_hlae_ffmpeg(exe, app_ffmpeg)
+    assert str(app_ffmpeg) in ini.read_bytes()[2:].decode("utf-16-le")
+    assert tools.hlae_ffmpeg_path(exe) == app_ffmpeg
+
+
+def test_utf8_ini_without_bom_reads_garbled_like_hlae_and_is_rewritten(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "ANSI_CODEC", "cp1252")
+    exe = make_hlae(tmp_path / "HLAE")
+    app_ffmpeg = tmp_path / "José" / "ffmpeg.exe"
+    app_ffmpeg.parent.mkdir()
+    app_ffmpeg.write_bytes(b"MZ")
+    ini = tools.hlae_ffmpeg_ini(exe)
+    ini.parent.mkdir()
+    ini.write_text(f"[Ffmpeg]\nPath={app_ffmpeg}", encoding="utf-8")  # what CS Demo Manager writes
+    assert tools.hlae_ffmpeg_path(exe) is None  # HLAE would look for ...\JosÃ©\ffmpeg.exe
+    tools.register_hlae_ffmpeg(exe, app_ffmpeg)
+    assert tools.hlae_ffmpeg_path(exe) == app_ffmpeg
+
+
+def test_decode_ini_handles_every_bom_and_the_ansi_code_page(monkeypatch):
+    monkeypatch.setattr(tools, "ANSI_CODEC", "cp1252")
+    text = "[Ffmpeg]\r\nPath=C:\\José\\ffmpeg.exe\r\n"
+    assert tools.decode_ini(codecs.BOM_UTF16_LE + text.encode("utf-16-le")) == text
+    assert tools.decode_ini(codecs.BOM_UTF16_BE + text.encode("utf-16-be")) == text
+    assert tools.decode_ini(codecs.BOM_UTF8 + text.encode("utf-8")) == text
+    assert tools.decode_ini(text.encode("cp1252")) == text
+    assert tools.decode_ini(text.encode("utf-8")) == text.replace("é", "Ã©")
+
+
+def test_can_register_hlae_ffmpeg_probes_without_leaving_files(tmp_path):
+    exe = make_hlae(tmp_path / "HLAE")
+    folder = tmp_path / "HLAE" / "ffmpeg"
+    assert tools.can_register_hlae_ffmpeg(exe)
+    assert not folder.exists()  # created for the probe, then removed
+    folder.mkdir()
+    assert tools.can_register_hlae_ffmpeg(exe)
+    assert list(folder.iterdir()) == []
+    ini = folder / "ffmpeg.ini"
+    ini.write_bytes(b"[Ffmpeg]\r\n")
+    assert tools.can_register_hlae_ffmpeg(exe)
+    assert ini.read_bytes() == b"[Ffmpeg]\r\n"
+
+
+def test_can_register_hlae_ffmpeg_reports_unwritable_folders(tmp_path, monkeypatch):
+    exe = make_hlae(tmp_path / "HLAE")
+    (tmp_path / "HLAE" / "ffmpeg").write_bytes(b"")  # a file where the folder should be
+    assert not tools.can_register_hlae_ffmpeg(exe)
+    (tmp_path / "HLAE" / "ffmpeg").unlink()
+
+    def denied(*args, **kwargs):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(tools.tempfile, "TemporaryFile", denied)  # Program Files without admin rights
+    assert not tools.can_register_hlae_ffmpeg(exe)
+    assert not (tmp_path / "HLAE" / "ffmpeg").exists()
 
 
 class FakeProc:
@@ -345,6 +414,78 @@ def test_window_title_check_is_false_off_windows():
     assert tools.window_title_exists(tools.HOOK_ERROR_TITLE) is False
 
 
+class FakeUser32:
+    """EnumWindows that stops when the callback returns 0, as Windows does. Handles start at 1."""
+
+    def __init__(self, windows):
+        self.windows = windows  # (visible, title or an exception to raise)
+        self.visited = []
+
+    def _window(self, hwnd):
+        return self.windows[hwnd - 1]
+
+    def EnumWindows(self, callback, lparam):
+        for hwnd in range(1, len(self.windows) + 1):
+            self.visited.append(hwnd)
+            if not callback(hwnd, lparam):
+                return 0
+        return 1
+
+    def IsWindowVisible(self, hwnd):
+        return self._window(hwnd)[0]
+
+    def GetWindowTextLengthW(self, hwnd):
+        title = self._window(hwnd)[1]
+        if isinstance(title, Exception):
+            raise title
+        return len(title)
+
+    def GetWindowTextW(self, hwnd, buf, size):
+        buf.value = self._window(hwnd)[1][: size - 1]
+        return len(buf.value)
+
+
+WINDOWS = [
+    (True, "Steam"),
+    (True, OSError("window closed while reading")),
+    (False, "Error - AfxHookSource2 (hidden)"),
+    (True, ""),
+    (True, "Error - AfxHookSource2"),
+    (True, "Counter-Strike 2"),
+]
+
+
+@pytest.mark.parametrize("wrap", [lambda fn: fn, ctypes.CFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)])
+def test_window_enumeration_visits_every_window(wrap):
+    user32 = FakeUser32(WINDOWS)
+    assert tools.any_window_title(user32, wrap, tools.HOOK_ERROR_TITLE)
+    assert user32.visited == [1, 2, 3, 4, 5, 6]  # a failing window or a match never stops the walk
+    user32 = FakeUser32(WINDOWS[:4])
+    assert not tools.any_window_title(user32, wrap, tools.HOOK_ERROR_TITLE)
+    assert user32.visited == [1, 2, 3, 4]
+
+
+def test_window_title_exists_uses_declared_user32_on_windows(monkeypatch):
+    user32 = FakeUser32(WINDOWS)
+    monkeypatch.setattr(tools, "_user32", lambda: (user32, lambda fn: fn))
+    monkeypatch.setattr(tools.sys, "platform", "win32")
+    assert tools.window_title_exists(tools.HOOK_ERROR_TITLE)
+    assert not tools.window_title_exists("No such window")
+
+
+def test_declare_user32_sets_every_signature():
+    names = ("EnumWindows", "IsWindowVisible", "GetWindowTextLengthW", "GetWindowTextW")
+    user32 = SimpleNamespace(**{name: SimpleNamespace() for name in names})
+    proc_type = ctypes.CFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    tools.declare_user32(user32, proc_type)
+    assert user32.EnumWindows.argtypes == (proc_type, wintypes.LPARAM)
+    assert user32.IsWindowVisible.argtypes == (wintypes.HWND,)
+    assert user32.GetWindowTextLengthW.argtypes == (wintypes.HWND,)
+    assert user32.GetWindowTextW.argtypes == (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    assert user32.EnumWindows.restype is wintypes.BOOL and user32.IsWindowVisible.restype is wintypes.BOOL
+    assert user32.GetWindowTextLengthW.restype is ctypes.c_int and user32.GetWindowTextW.restype is ctypes.c_int
+
+
 def test_preflight_runs_on_linux_and_reports_not_ok():
     checks = preflight(None, None)
     assert [c.name for c in checks] == [
@@ -355,6 +496,7 @@ def test_preflight_runs_on_linux_and_reports_not_ok():
         "HLAE installed",
         "HLAE FFmpeg",
         "FFmpeg",
+        "FFprobe",
     ]
     assert all(isinstance(c, Check) and c.detail for c in checks)
     by_name = {c.name: c for c in checks}
@@ -378,6 +520,31 @@ def test_preflight_all_ok_with_fakes(tmp_path, monkeypatch):
     assert all_ok(checks)
     hlae_ffmpeg = next(c for c in checks if c.name == "HLAE FFmpeg")
     assert "point it at C:/app/ffmpeg.exe" in hlae_ffmpeg.detail
+    assert not (hlae_exe.parent / "ffmpeg").exists()  # the write probe cleans up
+
+
+def test_preflight_flags_an_hlae_folder_it_cannot_write(tmp_path, monkeypatch):
+    hlae_exe = make_hlae(tmp_path / "Program Files" / "HLAE")
+    monkeypatch.setattr(preflight_mod.ffmpeg, "find_tool", lambda name: f"C:/app/{name}.exe")
+    monkeypatch.setattr(tools, "can_register_hlae_ffmpeg", lambda exe: False)
+    check = next(c for c in preflight(None, hlae_exe) if c.name == "HLAE FFmpeg")
+    assert not check.ok
+    assert "cannot write to" in check.detail and str(hlae_exe.parent / "ffmpeg" / "bin") in check.detail
+    assert "administrator" in check.detail
+
+    (hlae_exe.parent / "ffmpeg" / "bin").mkdir(parents=True)
+    (hlae_exe.parent / "ffmpeg" / "bin" / "ffmpeg.exe").write_bytes(b"MZ")
+    check = next(c for c in preflight(None, hlae_exe) if c.name == "HLAE FFmpeg")
+    assert check.ok  # its own FFmpeg needs no write
+
+
+def test_preflight_needs_ffprobe_for_export(monkeypatch):
+    monkeypatch.setattr(preflight_mod.ffmpeg, "find_tool", lambda name: None if name == "ffprobe" else f"/bin/{name}")
+    by_name = {c.name: c for c in preflight(None, None)}
+    assert by_name["FFmpeg"].ok
+    assert not by_name["FFprobe"].ok and "ffprobe" in by_name["FFprobe"].detail
+    monkeypatch.setattr(preflight_mod.ffmpeg, "find_tool", lambda name: f"/bin/{name}")
+    assert next(c for c in preflight(None, None) if c.name == "FFprobe").detail == "/bin/ffprobe"
 
 
 def test_preflight_flags_running_cs2_missing_hook_and_ffmpeg(tmp_path, monkeypatch):
@@ -389,7 +556,7 @@ def test_preflight_flags_running_cs2_missing_hook_and_ffmpeg(tmp_path, monkeypat
     bad = {c.name: c for c in problems(preflight(game, hlae_exe))}
     assert "CS2 closed" in bad and "Close CS2" in bad["CS2 closed"].detail
     assert "injector.exe" in bad["HLAE installed"].detail
-    assert "HLAE FFmpeg" in bad and "FFmpeg" in bad
+    assert "HLAE FFmpeg" in bad and "FFmpeg" in bad and "FFprobe" in bad
     assert "CS2 installed" not in bad and "Steam running" not in bad
 
 

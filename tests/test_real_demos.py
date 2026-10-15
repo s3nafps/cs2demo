@@ -169,3 +169,35 @@ def test_scan_shows_scoreboard_kills():
 
     assert {p.steamid: p.kills for p in scan.players} == {sid: int(row["kills_total"]) for sid, row in game.items()}
     assert sum(r.kills for r in scan.rounds) == 163
+
+
+def clutches(data) -> list[tuple[int, str]]:
+    from cs2hl.detect import DetectConfig, detect_highlights
+
+    found = detect_highlights(data.rounds, data.kills, data.rosters, DetectConfig(min_kills=1), deaths=data.deaths)
+    return [(h.round_num, h.label) for h in found if h.kind == "clutch"]
+
+
+def deaths_without_a_kill(data) -> list[tuple[int, int, int]]:
+    killed = {(k.tick, k.victim_steamid) for k in data.kills}
+    return [d for d in data.deaths if (d[0], d[2]) not in killed]
+
+
+def test_mm_deaths_include_a_world_death():
+    data = parsed("mm.dem").data
+
+    assert len(data.deaths) == 43
+    assert {(k.tick, k.victim_steamid) for k in data.kills} <= {(t, v) for t, _, v in data.deaths}
+    # Round 3: a T dies to world damage, leaving one T against five CTs; CT still wins.
+    assert [(tick, rnd, data.player_names[v]) for tick, rnd, v in deaths_without_a_kill(data)] == [
+        (13704, 3, "Nagi")
+    ]
+    assert clutches(data) == [(2, "2K + 1v2"), (7, "3K + 1v2")]
+
+
+def test_faceit_deaths_are_the_round_kills():
+    data = parsed("faceit.dem").data
+
+    assert len(data.deaths) == 163
+    assert deaths_without_a_kill(data) == []
+    assert clutches(data) == [(10, "1v1"), (19, "1v1")]

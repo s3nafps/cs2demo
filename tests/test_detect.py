@@ -216,3 +216,99 @@ def test_highlight_label_parts():
 
 def test_no_highlights_for_round_without_kills():
     assert run([]) == []
+
+
+def run_with_deaths(kills, deaths, winner="T", roster=ROSTER, rounds=None):
+    rounds = rounds or [Round(number=1, start_tick=0, end_tick=20000, winner_side=winner)]
+    rosters = {r.number: roster for r in rounds}
+    return detect_highlights(rounds, kills, rosters, DetectConfig(tickrate=TICKRATE), deaths=deaths)
+
+
+def deaths_of(kills, *others):
+    """DemoData.deaths for these kills plus the (tick, victim) deaths without a kill, in round 1."""
+    found = [(k.tick, k.round_num, k.victim_steamid) for k in kills] + [(t, 1, v) for t, v in others]
+    return tuple(sorted(found))
+
+
+def test_world_damage_death_makes_a_clutch():
+    roster = {1: "T", 2: "T", 3: "T", 11: "CT", 12: "CT"}
+    kills = [kill(500, 11, 2), kill(900, 1, 11), kill(1000, 1, 12)]
+    deaths = deaths_of(kills, (700, 3))  # T3 falls to his death: T1 is alone vs two
+
+    assert [(h.label, h.kind) for h in run_with_deaths(kills, deaths, roster=roster)] == [("2K + 1v2", "clutch")]
+    assert [h.label for h in run(kills, roster=roster)] == ["2K"]  # kills alone keep T3 alive
+
+
+def test_single_kill_clutch_after_a_world_death_is_kept():
+    roster = {1: "T", 2: "T", 3: "T", 11: "CT"}
+    kills = [kill(500, 11, 2), kill(900, 1, 11)]
+    deaths = deaths_of(kills, (700, 3))
+
+    assert [(h.label, h.kills) for h in run_with_deaths(kills, deaths, roster=roster)] == [("1v1", 1)]
+    assert run(kills, roster=roster) == []
+
+
+def test_team_kill_death_makes_a_clutch_but_is_not_one_of_the_kills():
+    roster = {1: "T", 2: "T", 3: "T", 11: "CT", 12: "CT"}
+    team_kill = kill(400, 1, 2)  # in kills as a fake might pass it; parse leaves it out
+    kills = [team_kill, kill(600, 11, 3), kill(900, 1, 11), kill(1000, 1, 12)]
+
+    found = run_with_deaths(kills, deaths_of(kills), roster=roster)
+
+    assert [(h.label, h.kills, h.kill_ticks) for h in found] == [("2K + 1v2", 2, (900, 1000))]
+
+
+def test_team_kill_left_out_of_kills_still_removes_the_victim():
+    roster = {1: "T", 2: "T", 3: "T", 11: "CT", 12: "CT"}
+    kills = [kill(600, 11, 3), kill(900, 1, 11), kill(1000, 1, 12)]
+    deaths = deaths_of(kills, (400, 2))  # T1 team-killed T2, as parse records it: a death, no kill
+
+    assert [h.label for h in run_with_deaths(kills, deaths, roster=roster)] == ["2K + 1v2"]
+
+
+def test_suicide_makes_a_clutch():
+    roster = {1: "T", 2: "T", 11: "CT", 12: "CT"}
+    kills = [kill(900, 1, 11), kill(1000, 1, 12)]
+    deaths = deaths_of(kills, (500, 2))  # T2 dies to his own grenade
+
+    assert [h.label for h in run_with_deaths(kills, deaths, roster=roster)] == ["2K + 1v2"]
+
+
+def test_a_suicide_in_kills_does_not_count_as_the_clutch_kill():
+    roster = {1: "T", 2: "T", 11: "CT", 12: "CT"}
+    kills = [kill(400, 1, 11), kill(600, 12, 2), kill(900, 1, 1)]  # T1 alone, then only kills himself
+
+    assert run(kills, winner="T", roster=roster) == []
+
+
+def test_without_deaths_kills_decide_who_is_alive():
+    roster = {1: "T", 2: "T", 3: "T", 11: "CT", 12: "CT"}
+    kills = [kill(500, 11, 2), kill(800, 12, 3), kill(900, 1, 11), kill(1000, 1, 12)]
+
+    without = run_with_deaths(kills, (), roster=roster)
+
+    assert without == run_with_deaths(kills, deaths_of(kills), roster=roster) == run(kills, roster=roster)
+    assert [h.label for h in without] == ["2K + 1v2"]
+
+
+def test_deaths_only_count_in_their_own_round():
+    roster = {1: "T", 2: "T", 3: "T", 11: "CT", 12: "CT"}
+    rounds = [
+        Round(number=1, start_tick=0, end_tick=5000, winner_side="T"),
+        Round(number=2, start_tick=6000, end_tick=12000, winner_side="T"),
+    ]
+    kills = [kill(500, 11, 2), kill(900, 1, 11), kill(1000, 1, 12)]
+    deaths = (
+        *deaths_of(kills),
+        (7000, 2, 3),  # T3 dies in round 2, not round 1
+        (5500, 1, 3),  # after round 1 ended
+    )
+
+    assert [h.label for h in run_with_deaths(kills, deaths, roster=roster, rounds=rounds)] == ["2K"]
+
+
+def test_players_who_die_at_the_same_tick_leave_together():
+    roster = {1: "T", 2: "T", 11: "CT", 12: "CT"}
+    kills = [kill(500, 12, 2), kill(500, 2, 12), kill(900, 1, 11)]  # a trade on one tick
+
+    assert [h.label for h in run(kills, winner="T", roster=roster)] == ["1v1"]

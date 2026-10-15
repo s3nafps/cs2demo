@@ -25,6 +25,7 @@ from cs2hl.capture.hlae import (
     demo_stem,
     ffmpeg_preset_line,
     hlae_launch_args,
+    hlae_process_env,
     is_settled,
     mux_command,
     record_name,
@@ -336,6 +337,28 @@ def test_steam_env_without_a_steam_folder():
     assert steam_env(None) == ["SteamClientLaunch=1", "SteamGameId=730", "SteamAppId=730", "SteamOverlayGameId=730"]
 
 
+def test_hlae_process_env_drops_inherited_steam_ids_ignoring_case():
+    inherited = {
+        "PATH": r"C:\Windows",
+        "STEAMAPPID": "2147483648",  # os.environ on Windows upper-cases names
+        "SteamGameId": "15561574998464659456",
+        "steamclientlaunch": "1",
+        "SteamOverlayGameId": "15561574998464659456",
+        "SteamPath": r"D:\OtherSteam",
+        "SteamEnv": "1",
+    }
+    assert hlae_process_env(inherited) == {"PATH": r"C:\Windows", "SteamEnv": "1"}
+    added = {item.split("=", 1)[0].lower() for item in steam_env(Path("Steam"))}
+    assert added == {key.lower() for key in hlae.STEAM_ENV_KEYS}
+
+
+def test_hlae_process_env_defaults_to_the_app_environment(monkeypatch):
+    monkeypatch.setenv("SteamAppId", "2147483648")
+    monkeypatch.setenv("CS2HL_TEST_VAR", "kept")
+    env = hlae_process_env()
+    assert "SteamAppId" not in env and env["CS2HL_TEST_VAR"] == "kept"
+
+
 def test_config_derives_cs2_paths(tmp_path):
     config = HlaeConfig(cs2_dir=tmp_path / "CS2", hlae_exe=tmp_path / "HLAE.exe")
     assert config.cs2_exe == tmp_path / "CS2" / "game" / "bin" / "win64" / "cs2.exe"
@@ -419,6 +442,7 @@ class FakeWorld:
         self.running = {"steam.exe"}
         self.killed: list[str] = []
         self.launches: list[list[str]] = []
+        self.envs: list[dict[str, str] | None] = []
         self.cfgs: list[str] = []
         self.procs: list[FakeHlaeProcess] = []
         self.skip: set[str] = set()
@@ -449,8 +473,9 @@ class FakeWorld:
         self.seen_running.set()
         return int(was)
 
-    def popen(self, args):
+    def popen(self, args, env=None):
         self.launches.append(list(args))
+        self.envs.append(None if env is None else dict(env))
         proc = FakeHlaeProcess(self.hlae_rc, self.hlae_hangs)
         self.procs.append(proc)
         if not self.hlae_hangs:
@@ -555,6 +580,16 @@ def test_render_records_every_segment_unattended(world):
     assert f"SteamPath={world.tmp / 'Steam'}" in args
     assert not any((world.config.stage_dir / "work").iterdir())  # takes are cleaned up
     assert "cs2.exe" not in world.fake.killed  # it quit on its own
+
+
+def test_hlae_is_started_without_the_apps_steam_ids(world, monkeypatch):
+    monkeypatch.setenv("SteamAppId", "2147483648")
+    monkeypatch.setenv("SteamGameId", "15561574998464659456")
+    render(world, make_plan(make_clip("a", 1000, 2000)))
+    env = world.fake.envs[0]
+    assert env is not None and "SteamAppId" not in env and "SteamGameId" not in env
+    assert env.get("PATH") == os.environ.get("PATH")
+    assert "SteamAppId=730" in world.fake.launches[0]
 
 
 def test_already_running_cs2_is_refused(world):
@@ -703,6 +738,20 @@ def test_nothing_recorded_stops_with_a_clear_message(world, monkeypatch):
     assert "cs2.exe" in world.fake.killed
 
 
+def test_stalled_session_is_closed_and_keeps_finished_clips(world, monkeypatch):
+    monkeypatch.setattr(hlae, "STALL_AFTER_S", 0.2)
+    world.fake.cs2_quits = False
+    world.fake.skip = {"clip002_r07_s0"}  # CS2 hangs before this take starts
+    a, b = two_clip_plan_clips()
+    later = make_clip("c", 5500, 5800, slot=4)  # overlaps b, so it needs a second CS2 run
+    results = render(world, make_plan(a, b, later))
+    assert "cs2.exe" in world.fake.killed
+    assert results[0].error is None
+    assert "CS2 stopped recording: nothing new was written for 0.2 s" in results[1].error
+    assert results[2].error.startswith("not recorded: CS2 stopped recording")
+    assert len(world.fake.launches) == 1
+
+
 def test_hook_error_window_stops_the_session(world, monkeypatch):
     monkeypatch.setattr(tools, "window_title_exists", lambda prefix: prefix == "Error - AfxHookSource")
     world.fake.cs2_quits = False
@@ -721,6 +770,19 @@ def test_hlae_without_ffmpeg_is_pointed_at_the_app_ffmpeg(world, monkeypatch):
     monkeypatch.setattr(ffmpeg_mod, "find_tool", lambda name: str(app_ffmpeg) if name == "ffmpeg" else None)
     render(world, make_plan(make_clip("a", 1000, 2000)))
     assert tools.hlae_ffmpeg_path(world.config.hlae_exe) == app_ffmpeg
+
+
+def test_unwritable_hlae_folder_is_a_clear_error(world, monkeypatch):
+    (world.config.hlae_exe.parent / "ffmpeg" / "bin" / "ffmpeg.exe").unlink()
+    monkeypatch.setattr(ffmpeg_mod, "find_tool", lambda name: "C:/app/ffmpeg.exe" if name == "ffmpeg" else None)
+
+    def denied(hlae_exe, ffmpeg_exe):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(tools, "register_hlae_ffmpeg", denied)
+    with pytest.raises(CaptureError, match="cannot write to its folder .*administrator"):
+        render(world, make_plan(make_clip("a", 1000, 2000)))
+    assert world.fake.launches == []
 
 
 def test_wav_without_ffmpeg_keeps_a_silent_video(world):
@@ -816,3 +878,40 @@ def test_session_watch_reasons_with_a_fake_clock(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools, "window_title_exists", lambda prefix: True)
     assert watch.check() == "hook-error"
+
+
+def test_session_watch_stops_when_a_later_take_never_starts(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "window_title_exists", lambda prefix: False)
+    now = [0.0]
+    dirs = [tmp_path / f"a_s{i}" for i in range(3)]
+    for d in dirs:
+        d.mkdir()
+    watch = hlae._SessionWatch(dirs, clock=lambda: now[0], first_take_s=300, idle_s=60, stall_s=240)
+    video = dirs[0] / "take0000" / "video.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"1")
+    now[0] = 10
+    assert watch.check() is None
+    now[0] = 200  # a long seek or a slow segment: still fine
+    video.write_bytes(b"12")
+    assert watch.check() is None
+    (dirs[1] / "take0000").mkdir()  # the next take appears; its video comes a little later
+    now[0] = 430
+    assert watch.check() is None  # the new folder counts as progress
+    now[0] = 669
+    assert watch.check() is None
+    now[0] = 670
+    assert watch() and watch.reason == "stalled"
+    assert "240 s" in watch.message() and "closed" in watch.message()
+
+
+def test_session_watch_prefers_finished_over_stalled(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "window_title_exists", lambda prefix: False)
+    now = [0.0]
+    take = tmp_path / "a_s0" / "take0000"
+    take.mkdir(parents=True)
+    (take / "video.mp4").write_bytes(b"1")
+    watch = hlae._SessionWatch([tmp_path / "a_s0"], clock=lambda: now[0], idle_s=60, stall_s=30)
+    assert watch.check() is None
+    now[0] = 60
+    assert watch.check() == "finished"
