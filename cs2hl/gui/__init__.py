@@ -1,1 +1,1 @@
-"""Desktop UI for cs2hl: a PySide6 window with background workers and table models."""
+"""Desktop app "CS2 Highlights": open a demo, pick the player, choose one video or clips, generate."""

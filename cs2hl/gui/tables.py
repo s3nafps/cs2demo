@@ -1,4 +1,4 @@
-"""Table models for the scan results and the planned clips."""
+"""Table models for the players, rounds, found highlights and setup checks."""
 
 from __future__ import annotations
 
@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Hashable, Iterable, Sequence
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
-from PySide6.QtWidgets import QAbstractItemView, QTableView
+from PySide6.QtGui import QBrush, QColor
+from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableView
+
+GOOD = QColor("#2e7d32")
+BAD = QColor("#c62828")
 
 
 def clock(seconds: float) -> str:
@@ -19,11 +23,22 @@ def span(start_s: float, end_s: float) -> str:
     return f"{clock(start_s)} - {clock(end_s)}"
 
 
+def clip_length_s(clip: Any) -> float:
+    """Seconds of video a clip makes: the sum of its segments, or its whole span."""
+    whole = max(0.0, clip.end_s - clip.start_s)
+    ticks = clip.end_tick - clip.start_tick
+    if not clip.segments or ticks <= 0:
+        return whole
+    per_tick = whole / ticks
+    return sum(max(0, end - start) for start, end in clip.segments) * per_tick
+
+
 @dataclass(frozen=True)
 class Column:
     title: str
     text: Callable[[Any], str]
     right: bool = False
+    good: Callable[[Any], bool | None] | None = None  # colours the text green (True) or red (False)
 
 
 class RowTable(QAbstractTableModel):
@@ -63,6 +78,9 @@ class RowTable(QAbstractTableModel):
             return column.text(row)
         if role == Qt.ItemDataRole.TextAlignmentRole and column.right:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if role == Qt.ItemDataRole.ForegroundRole and column.good is not None:
+            good = column.good(row)
+            return None if good is None else QBrush(GOOD if good else BAD)
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
@@ -117,6 +135,32 @@ class RowTable(QAbstractTableModel):
         self.checkedChanged.emit()
 
 
+class PlayerTable(RowTable):
+    """Players of the demo. The one marked "This is me" gets "(you)" after the name."""
+
+    def __init__(self, parent: Any = None) -> None:
+        super().__init__(PLAYER_COLUMNS, parent=parent)
+        self.me: int | None = None
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        value = super().data(index, role)
+        if role == Qt.ItemDataRole.DisplayRole and index.column() == 0 and self._is_me(index.row()):
+            return f"{value}  (you)"
+        return value
+
+    def set_me(self, steamid: int | None) -> None:
+        self.me = steamid
+        if self._rows:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self._rows) - 1, 0), [Qt.ItemDataRole.DisplayRole])
+
+    def row_of(self, steamid: int | None) -> int | None:
+        ids = [p.steamid for p in self._rows]
+        return ids.index(steamid) if steamid in ids else None
+
+    def _is_me(self, row: int) -> bool:
+        return self.me is not None and self._rows[row].steamid == self.me
+
+
 ROUND_COLUMNS = (
     Column("Round", lambda r: str(r.number), right=True),
     Column("Time", lambda r: span(r.start_s, r.end_s)),
@@ -129,16 +173,20 @@ PLAYER_COLUMNS = (
     Column("Side", lambda p: p.side or "-"),
     Column("Kills", lambda p: str(p.kills), right=True),
     Column("Deaths", lambda p: str(p.deaths), right=True),
-    Column("Rounds", lambda p: str(p.rounds_played), right=True),
 )
 
 CLIP_COLUMNS = (
-    Column("Clip", lambda c: c.id),
-    Column("Time", lambda c: span(c.start_s, c.end_s)),
-    Column("POV", lambda c: c.pov_name),
-    Column("Labels", lambda c: " + ".join(c.labels)),
+    Column("Round", lambda c: str(c.round_num), right=True),
+    Column("Moment", lambda c: " + ".join(c.labels) or "-"),
+    Column("Demo time", lambda c: span(c.start_s, c.end_s)),
+    Column("Length", lambda c: clock(clip_length_s(c)), right=True),
     Column("Score", lambda c: f"{c.score:.1f}", right=True),
-    Column("Tags", lambda c: ", ".join(c.tags)),
+)
+
+CHECK_COLUMNS = (
+    Column("Check", lambda c: c.name),
+    Column("Status", lambda c: "OK" if c.ok else ("Needs fixing" if c.required else "Note"), good=lambda c: c.ok),
+    Column("Details", lambda c: c.detail),
 )
 
 
@@ -146,23 +194,33 @@ def rounds_model(parent: Any = None) -> RowTable:
     return RowTable(ROUND_COLUMNS, key=lambda r: r.number, parent=parent)
 
 
-def players_model(parent: Any = None) -> RowTable:
-    return RowTable(PLAYER_COLUMNS, key=lambda p: p.steamid, parent=parent)
-
-
 def clips_model(parent: Any = None) -> RowTable:
     return RowTable(CLIP_COLUMNS, parent=parent)
 
 
-def make_view(model: RowTable) -> QTableView:
+def checks_model(parent: Any = None) -> RowTable:
+    return RowTable(CHECK_COLUMNS, parent=parent)
+
+
+def make_view(model: RowTable, single: bool = False, stretch: int | None = None) -> QTableView:
+    """A read-only table. ``single`` allows picking one row; ``stretch`` is the column that takes spare width."""
     view = QTableView()
     view.setModel(model)
     view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    if single:
+        view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    else:
+        view.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
     view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     view.setAlternatingRowColors(True)
     view.verticalHeader().setVisible(False)
-    view.horizontalHeader().setStretchLastSection(True)
-    model.modelReset.connect(view.resizeColumnsToContents)
+    header = view.horizontalHeader()
+    if stretch is None:
+        header.setStretchLastSection(True)
+        model.modelReset.connect(view.resizeColumnsToContents)
+    else:
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(stretch, QHeaderView.ResizeMode.Stretch)
     return view
 
 

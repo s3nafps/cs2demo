@@ -16,10 +16,12 @@ def build_parser() -> argparse.ArgumentParser:
     analyze = sub.add_parser("analyze", help="Find highlights in a .dem file and write a plan.")
     analyze.add_argument("demo", type=Path, help="Path to the .dem file")
     analyze.add_argument("-o", "--output", type=Path, help="Plan JSON path (default: <demo>.plan.json)")
-    analyze.add_argument("--min-score", type=float, default=5.0, help="Drop highlights below this score")
-    analyze.add_argument("--pre-roll", type=float, default=4.0, help="Seconds kept before the moment")
-    analyze.add_argument("--post-roll", type=float, default=2.0, help="Seconds kept after the moment")
-    analyze.add_argument("--streak-gap", type=float, default=10.0, help="Max seconds between kills in one multikill")
+    analyze.add_argument("--min-kills", type=int, default=2, help="Kills in a round that make a highlight")
+    analyze.add_argument("--no-clutches", action="store_true", help="Do not count won clutches below --min-kills")
+    analyze.add_argument("--min-score", type=float, default=0.0, help="Drop highlights below this score")
+    analyze.add_argument("--pre-roll", type=float, default=3.0, help="Seconds kept before each kill")
+    analyze.add_argument("--post-roll", type=float, default=2.0, help="Seconds kept after each kill")
+    analyze.add_argument("--merge-gap", type=float, default=3.0, help="Join kill windows closer than this")
     analyze.add_argument("--max-clips", type=int, help="Keep only the N highest-scoring clips")
     analyze.add_argument("--players", type=int, nargs="+", metavar="STEAMID",
                          help="Only highlights where these players (steamid64) are the POV")
@@ -28,7 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     export = sub.add_parser("export", help="Render a plan's clips into 16:9 and/or 9:16 files.")
     export.add_argument("plan", type=Path, help="Plan JSON written by 'analyze'")
-    export.add_argument("--recordings", type=Path, required=True, help="Dir with <clip id>.<ext> recordings")
+    export.add_argument(
+        "--recordings", type=Path, required=True,
+        help="Dir with <clip id>_s<k>.<ext> recordings (or <clip id>.<ext> for one-piece clips)",
+    )
+    export.add_argument("--output", choices=["montage", "clips", "both"], default="montage",
+                        help="One video with every highlight, one file per highlight, or both")
     export.add_argument("--out", type=Path, default=Path("output"), help="Output directory")
     export.add_argument("--aspect", nargs="+", choices=["16x9", "9x16"], default=["16x9", "9x16"])
     export.add_argument("--vertical-mode", choices=["crop", "fit"], default="crop")
@@ -56,9 +63,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         data,
         selection,
         HighlightOptions(
-            streak_gap_s=args.streak_gap,
+            min_kills=args.min_kills,
+            include_clutches=not args.no_clutches,
             pre_roll_s=args.pre_roll,
             post_roll_s=args.post_roll,
+            merge_gap_s=args.merge_gap,
             min_score=args.min_score,
             max_clips=args.max_clips,
         ),
@@ -69,6 +78,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     meta = data.meta
     print(f"{meta.demo_name} | map {meta.map_name} | {len(data.rounds)} rounds | {len(data.kills)} kills")
+    for warning in data.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     if not plan.clips:
         print("No clips passed the score threshold.")
     for clip in plan.clips:
@@ -95,6 +106,8 @@ def cmd_export(args: argparse.Namespace) -> int:
         settings=settings,
         vertical_mode=args.vertical_mode,
         x_offset=args.x_offset,
+        output=args.output,
+        log=print,
     )
 
     failed = 0

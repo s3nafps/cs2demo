@@ -1,5 +1,8 @@
 name: windows-build
 
+# Builds the one-folder app with PyInstaller and wraps it, with FFmpeg, in an Inno Setup
+# installer: CS2Highlights-Setup-<version>.exe. Push a v<version> tag or run it by hand.
+
 on:
   workflow_dispatch:
   push:
@@ -9,55 +12,131 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
-  build-windows:
+  installer:
     runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # Third-party builds: gyan.dev FFmpeg (GPL v3) and Inno Setup from Chocolatey.
+      FFMPEG_BUILDS: https://www.gyan.dev/ffmpeg/builds
+      INNO_SETUP_VERSION: "6.7.1"
+      STAGING: ${{ github.workspace }}\build\staging
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Install cs2hl with the GUI extra and PyInstaller
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           python -m pip install --upgrade pip
-          python -m pip install -e ".[gui]"
-          python -m pip install "pyinstaller==6.22.3"
+          python -m pip install -e ".[gui]" "pyinstaller==6.22.3"
+          python -m pip freeze
 
-      # Third-party download: gyan.dev publishes this as its latest release-essentials build.
-      # Check the URL and the build before a release. Only bin/ffmpeg.exe is kept.
-      - name: Download ffmpeg
-        shell: pwsh
+      - name: Read the app version
+        id: version
         run: |
           $ErrorActionPreference = "Stop"
-          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-          New-Item -ItemType Directory -Force -Path ffmpeg-download | Out-Null
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg-download/ffmpeg.zip
-          Expand-Archive -Path ffmpeg-download/ffmpeg.zip -DestinationPath ffmpeg-download/unpacked
-          $exe = Get-ChildItem -Path ffmpeg-download/unpacked -Recurse -Filter ffmpeg.exe |
-            Where-Object { $_.Directory.Name -eq "bin" } |
-            Select-Object -First 1
-          if (-not $exe) { throw "bin/ffmpeg.exe not found in the archive" }
-          Copy-Item $exe.FullName -Destination ffmpeg-download/ffmpeg.exe
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = (python -c "import importlib.metadata as m, cs2hl; v = cs2hl.__version__; assert m.version('cs2hl') == v, 'pyproject.toml and cs2hl/__init__.py disagree'; print(v)").Trim()
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "tag $env:GITHUB_REF_NAME does not match the app version $version"
+          }
+          $fileVersion = [regex]::Match($version, '^\d+(\.\d+){0,3}').Value
+          if (-not $fileVersion) { throw "version $version does not start with a number" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "file_version=$fileVersion" >> $env:GITHUB_OUTPUT
+          Write-Host "cs2hl $version"
 
-      # HLAE is not bundled: the user installs it separately and points the app at it.
-      - name: Build cs2hl-gui.exe
-        run: pyinstaller packaging/cs2hl-gui.spec --noconfirm --distpath dist --workpath build
+      - name: Build the app (one folder)
+        run: pyinstaller packaging/cs2hl.spec --noconfirm --distpath dist --workpath build/pyinstaller
 
-      - name: Place ffmpeg.exe next to the executable
-        shell: pwsh
+      # --self-check loads the libraries demoparser2 imports from native code and the GUI modules;
+      # then the window must stay up for 20 s on the offscreen Qt platform.
+      - name: Smoke-test the app
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = "Stop"
-          if (-not (Test-Path dist/cs2hl-gui.exe)) { throw "dist/cs2hl-gui.exe was not built" }
-          Copy-Item ffmpeg-download/ffmpeg.exe -Destination dist/ffmpeg.exe
-          & dist/ffmpeg.exe -version | Select-Object -First 1
+          $exe = "dist\CS2Highlights\CS2Highlights.exe"
+          if (-not (Test-Path $exe)) { throw "$exe was not built" }
+          $report = Join-Path $env:RUNNER_TEMP "self-check.txt"
+          $check = Start-Process -FilePath $exe -ArgumentList "--self-check", "`"$report`"" -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report }
+          if ($check.ExitCode -ne 0) { throw "self-check failed with exit code $($check.ExitCode)" }
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $app = Start-Process -FilePath $exe -PassThru
+          $null = $app.Handle  # keeps ExitCode readable after the process ends
+          Start-Sleep -Seconds 20
+          if ($app.HasExited) { throw "the app exited on start with code $($app.ExitCode)" }
+          Stop-Process -Id $app.Id -Force
 
-      - name: Upload the build
+      - name: Download FFmpeg
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ProgressPreference = "SilentlyContinue"
+          $release = (Invoke-RestMethod "$env:FFMPEG_BUILDS/release-version").Trim()
+          $zipUrl = "$env:FFMPEG_BUILDS/packages/ffmpeg-$release-essentials_build.zip"
+          $download = Join-Path $env:RUNNER_TEMP "ffmpeg"
+          New-Item -ItemType Directory -Force -Path $download, $env:STAGING | Out-Null
+          Invoke-WebRequest -Uri $zipUrl -OutFile "$download\ffmpeg.zip"
+          $expected = (Invoke-RestMethod "$zipUrl.sha256").Trim().Split()[0]
+          $actual = (Get-FileHash "$download\ffmpeg.zip" -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "ffmpeg.zip SHA-256 is $actual, gyan.dev lists $expected" }
+          Expand-Archive -Path "$download\ffmpeg.zip" -DestinationPath "$download\unpacked"
+          # The archive's top folder carries the version, so find each file by name.
+          $files = @{ "ffmpeg.exe" = "ffmpeg.exe"; "ffprobe.exe" = "ffprobe.exe"; "LICENSE" = "FFmpeg-LICENSE.txt"; "README.txt" = "FFmpeg-README.txt" }
+          foreach ($name in $files.Keys) {
+            $found = @(Get-ChildItem -Path "$download\unpacked" -Recurse -File -Filter $name)
+            if ($found.Count -ne 1) { throw "expected one $name in the FFmpeg archive, found $($found.Count)" }
+            Copy-Item $found[0].FullName -Destination (Join-Path $env:STAGING $files[$name])
+          }
+          foreach ($tool in "ffmpeg.exe", "ffprobe.exe") {
+            $banner = & (Join-Path $env:STAGING $tool) -version
+            Write-Host "$tool : $($banner[0])"
+          }
+
+      - name: Build the installer
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Find-Iscc {
+            $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($command) { return $command.Source }
+            Get-ChildItem -Path "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe", "$env:ProgramFiles\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            choco install innosetup --version=$env:INNO_SETUP_VERSION -y --no-progress
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw "ISCC.exe not found, even after installing Inno Setup" }
+          Write-Host "Using $iscc"
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" "/DFileVersion=${{ steps.version.outputs.file_version }}" "/DStagingDir=$env:STAGING" packaging\installer.iss
+          $setup = "dist\CS2Highlights-Setup-${{ steps.version.outputs.version }}.exe"
+          if (-not (Test-Path $setup)) { throw "$setup was not written" }
+          Write-Host ("{0}: {1:N1} MB" -f $setup, ((Get-Item $setup).Length / 1MB))
+
+      - name: Upload the installer
         uses: actions/upload-artifact@v4
         with:
-          name: cs2hl-gui-windows
-          path: dist/
+          name: CS2Highlights-Setup-${{ steps.version.outputs.version }}
+          path: dist/CS2Highlights-Setup-${{ steps.version.outputs.version }}.exe
+          if-no-files-found: error
+
+      - name: Upload the app folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: CS2Highlights-${{ steps.version.outputs.version }}-app-folder
+          path: dist/CS2Highlights/
           if-no-files-found: error

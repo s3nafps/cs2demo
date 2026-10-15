@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import DemoData, Kill, Side
+from .parse import Scoreboard
 
 
 @dataclass(frozen=True)
@@ -13,7 +14,7 @@ class PlayerSummary:
     steamid: int
     name: str
     side: Side | None  # side in the last round this player was in
-    kills: int
+    kills: int  # as the in-game scoreboard counts them when known
     deaths: int
     rounds_played: int
 
@@ -37,12 +38,25 @@ class DemoScan:
     rounds: list[RoundSummary]
     data: DemoData  # kept so the pipeline does not parse the demo a second time
 
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        return self.data.warnings
 
-def summarize(data: DemoData) -> DemoScan:
+
+def summarize(data: DemoData, scoreboard: Scoreboard | None = None) -> DemoScan:
+    """Players and rounds for the UI.
+
+    Player kills and deaths come from ``scoreboard`` when given (kills after round end and
+    deaths to world damage included, as the game counts them); otherwise from the in-round
+    kills. Round kill counts always use the in-round kills that highlights are made from.
+    """
     tickrate = data.meta.tickrate
     kills_by_round = _count_by(data.kills, lambda k: k.round_num)
-    kills_by_attacker = _count_by(data.kills, lambda k: k.attacker_steamid)
-    deaths_by_victim = _count_by(data.kills, lambda k: k.victim_steamid)
+    if scoreboard is None:
+        kills_by_attacker = _count_by(data.kills, lambda k: k.attacker_steamid)
+        deaths_by_victim = _count_by(data.kills, lambda k: k.victim_steamid)
+    else:
+        kills_by_attacker, deaths_by_victim = scoreboard.kills, scoreboard.deaths
 
     rounds = [
         RoundSummary(
@@ -88,15 +102,15 @@ def summarize(data: DemoData) -> DemoScan:
 
 
 def scan_demo(path: Path) -> DemoScan:
-    from .parse import load_demo
+    from .parse import read_demo
 
     try:
-        data = load_demo(path)
+        parsed = read_demo(path)
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as exc:  # demoparser2 raises pyo3 PanicException (a BaseException) on bad input
         raise ValueError(f"could not read {path.name} as a CS2 demo: {exc}") from exc
-    return summarize(data)
+    return summarize(parsed.data, parsed.scoreboard)
 
 
 def _count_by(kills: list[Kill], key) -> dict[int, int]:

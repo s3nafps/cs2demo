@@ -1,92 +1,87 @@
-# cs2hl: local CS2 highlight generator
+# CS2 Highlights (cs2hl)
 
-Pick a CS2 demo, choose the player and rounds, and get highlight clips in 16:9 and 9:16.
-Everything runs on your PC. The desktop app records clips through HLAE and CS2.
+Pick a CS2 demo and a player, and get that player's highlights as one video, separate
+clips, or both, in 16:9 and 9:16. Everything runs on your Windows PC: the app finds the
+highlights, records them in CS2 through HLAE, and edits the videos with FFmpeg.
 
-**Status: early.** Analysis, the desktop UI, the export step and the HLAE command
-generator are built and tested. Parsing a real `.dem` file and recording from CS2 have
-not been run yet. See [Status](#status).
+**Status: 0.2, not yet run in CS2.** Parsing and highlight picking are checked on two
+real demos. Recording through HLAE is written from HLAE's and CS Demo Manager's source
+and has not been run on a real PC yet. See [Status](#status).
 
-## Desktop app
+## Install
 
-```bash
-python -m venv .venv
-.venv/bin/pip install -e ".[gui,dev]"          # Windows: .venv\Scripts\pip install -e ".[gui,dev]"
-.venv/bin/cs2hl-gui                             # or: .venv/bin/python -m cs2hl.gui
-```
+1. Install [HLAE](https://github.com/advancedfx/advancedfx/releases) (the app does not
+   bundle it). Steam and Counter-Strike 2 must be installed.
+2. Run `CS2Highlights-Setup-<version>.exe`. It installs the app with FFmpeg, adds a Start
+   menu shortcut, and can optionally open `.dem` files with the app. No admin rights needed.
 
-1. **Open demo.** The app scans it in the background: map, duration, rounds and players.
-2. **Pick rounds** (all are included by default) and **tick the player(s)** to make highlights for.
-3. **Preview highlights** lists the clips that would be made.
-4. **Render** records each clip and exports the aspects you chose. The Backend setting
-   chooses "Plan only" (write the plan JSON and stop) or HLAE (record in CS2).
+The installer is built by the `windows-build` GitHub Actions workflow (see
+[packaging/README.md](packaging/README.md)).
 
-Settings are remembered between runs.
+## Use
+
+1. **Open a demo** (button, drag and drop, or double-click a `.dem` if you chose that in setup).
+   The app scans it in about a second.
+2. **Pick the player.** Tick "This is me" once, and the app picks you in every later demo.
+3. **Choose the output:** One video, Separate clips, or Both, and 16:9 and/or 9:16.
+4. **Generate.** The app starts CS2 through HLAE, records each highlight, closes CS2, and
+   exports the videos. Open folder shows the result.
+
+Keep the CS2 window open while it records, and don't play CS2 at the same time: the game
+runs with `-insecure`, so it can't join VAC servers in that session.
+
+The Advanced tab has the round filter, kills needed per round, clutches, pre- and post-roll,
+quality and capture size. The Setup tab shows what the app found (Steam, CS2, HLAE, FFmpeg)
+and lets you point it at a folder by hand.
+
+## What counts as a highlight
+
+| Highlight | Rule | Label |
+|---|---|---|
+| Multikill | 2 or more kills by the player in one round (setting: kills per round) | `2K`, `3K`, `4K`, `ACE` |
+| Clutch | last player alive against N enemies, and the round is won | `1v2`, or `3K + 1v2` |
+
+Each kill gets a window (3 s before, 2 s after by default). Windows close together merge,
+and a round's pieces are joined with cuts, so a 4K spread over 40 s becomes a 20 s clip.
+Scores are in `cs2hl/scoring.py` and only decide the order when you limit the clip count.
+
+## How recording works
+
+The app writes a start script to `<CS2>\game\csgo\cfg\cs2hl_boot.cfg` and launches
+`HLAE.exe -customLoader -noGui -autoStart ...` with CS2 set to `-insecure -sw -w W -h H
++exec cs2hl_boot`. The script sets up HLAE's FFmpeg recorder, hides the HUD except the kill
+feed, filters the kill feed to the chosen player, and schedules every piece on demo ticks
+with `mirv_cmd addAtTick`: seek, point the camera (`spec_mode 1`, `spec_player <slot>`),
+record, stop. It ends with `quit`; the app waits for `cs2.exe` to exit, collects the
+pieces, and exports. Details and sources are in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Command line
 
 ```bash
-cs2hl analyze match.dem --players 76561198000000000 --rounds 1 2 3 --max-clips 10
-cs2hl export match.plan.json --recordings recordings/ --aspect 16x9 9x16 --vertical-mode crop
-```
-
-`--players` takes SteamID64 values. `cs2hl analyze` without `--players` includes everyone.
-
-## Requirements
-
-- Windows for recording. HLAE only runs on Windows.
-- Counter-Strike 2 and [HLAE](https://github.com/advancedfx/advancedfx/releases) installed separately.
-- FFmpeg. The packaged app expects `ffmpeg.exe` next to it. HLAE needs its own ffmpeg:
-  `<HLAE>\ffmpeg\bin\ffmpeg.exe`, or a path in `<HLAE>\ffmpeg\ffmpeg.ini`.
-
-## Highlights (v1)
-
-| Kind | Meaning | Example label |
-|---|---|---|
-| multikill | 2+ kills by one player, each within 10 s of the last | `3K`, `ACE` |
-| clutch | last player alive vs N enemies, and the team wins the round | `1v2` |
-| team ace | one side kills every enemy alive at round start | `TEAM ACE` |
-
-Bonuses for headshots, noscopes, through smoke, wallbangs and knife kills, and a win
-bonus. The weights are in `cs2hl/scoring.py` and are first guesses.
-
-## Layout
-
-```
-cs2hl/
-  parse.py          demoparser2 -> DemoData                      [not yet run on a real demo]
-  scan.py           players and rounds summary for the UI         [tested]
-  detect.py         multikills, clutches, team aces               [tested]
-  selection.py      keep the chosen players and rounds            [tested]
-  pipeline.py       plan_highlights, render_plan                  [tested]
-  planner.py        clip windows, merging, plan JSON              [tested]
-  capture/
-    base.py         backend contract (CaptureBackend)
-    hlae.py         HLAE recording: session cfg, sessions, move   [source-checked, not run in CS2]
-  export.py         plan -> 16:9 / 9:16 files                     [tested]
-  ffmpeg.py         reframing, H.264 encoding, tool lookup        [tested with real ffmpeg]
-  gui/              PySide6 desktop app                           [tested offscreen]
-packaging/          PyInstaller spec and notes                    [built on Linux]
-.github/workflows/  windows-build.yml                             [not run yet]
-docs/DESIGN.md      research, verified facts, open questions
+cs2hl analyze match.dem --players 76561198000000000 --min-kills 2
+cs2hl export match.plan.json --recordings recordings/ --output both --aspect 16x9 9x16
 ```
 
 ## Status
 
 | Part | State |
 |---|---|
-| Analysis, selection, planning, plan JSON | Done, tested |
-| Desktop UI (scan, rounds, players, preview, render, cancel) | Done, tested offscreen |
-| 16:9 / 9:16 reframing and encoding | Done, verified with ffmpeg on synthetic video |
-| HLAE backend | Written. Recording commands checked against HLAE's CS2 source. Not run against CS2 yet |
-| Parsing a real `.dem` | **Not yet verified.** demoparser2 column names are unconfirmed |
-| POV selection in CS2 demos | **Not solved.** HLAE has no CS2 POV command. The recording shows the demo's own camera |
-| Windows build | Spec builds on Linux. Windows build runs in CI, not yet run |
+| Parsing (`parse.py`) | Checked on a matchmaking and a FACEIT demo: rounds, score and every player's kills match the game's own counters |
+| Highlight picking and clip cuts | Tested; checked on both real demos |
+| Export (clips, montage, both; 16:9 and 9:16) | Tested with real FFmpeg on synthetic video, including sound sync across cuts |
+| Desktop app | Tested offscreen on Linux; not yet run on Windows |
+| Steam, CS2 and HLAE discovery, setup checks | Tested with fakes; not yet run on Windows |
+| Recording through HLAE | Written from source; **not yet run in CS2** |
+| Installer | Built by CI on Windows; see packaging/README.md |
 
-## Tests
+## Development
 
 ```bash
+python -m venv .venv
+.venv/bin/pip install -e ".[gui,dev]"
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest
 ```
 
-Integration tests skip automatically when FFmpeg is not installed.
+Real-demo tests run when `CS2HL_DEMO_DIR` points at a folder with `mm.dem` and
+`faceit.dem` (the public test demos from https://ndownloader.figshare.com/files/52456259 and
+https://ndownloader.figshare.com/files/52455215).

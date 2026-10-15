@@ -44,3 +44,17 @@ def test_player_and_round_filters_combine():
 
 def test_empty_player_list_selects_nobody():
     assert filter_highlights(HIGHLIGHTS, Selection.of(players=[])) == []
+
+
+def test_filter_keeps_highlights_unchanged_and_in_order():
+    clutch = Highlight(
+        kind="clutch", label="2K + 1v2", round_num=4, player_steamid=1, player_name="p1",
+        start_tick=100, end_tick=900, kills=2, won_round=True, score=13.0,
+        tags=("clutch",), kill_ticks=(100, 900),
+    )
+    highlights = [*HIGHLIGHTS, clutch]
+
+    kept = filter_highlights(highlights, Selection.of(players=[1]))
+
+    assert kept == [HIGHLIGHTS[0], HIGHLIGHTS[2], clutch]
+    assert kept[-1] is clutch

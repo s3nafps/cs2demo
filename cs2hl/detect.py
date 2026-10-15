@@ -1,12 +1,13 @@
 """Find highlight moments in a parsed demo.
 
-Pure functions over the models in ``cs2hl.models``, so they are unit-testable
-without a demo file.
+One highlight per player per round: all of that player's kills in the round, kept when
+there are at least ``min_kills`` of them or the player won a clutch. Pure functions over
+the models in ``cs2hl.models``, so they are unit-testable without a demo file.
 """
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 
 from . import scoring
@@ -19,8 +20,15 @@ SIDES: tuple[Side, Side] = ("T", "CT")
 @dataclass(frozen=True)
 class DetectConfig:
     tickrate: float = 64.0
-    # Longest pause between two kills that still counts as one multikill.
-    streak_gap_s: float = 10.0
+    min_kills: int = 2  # kills by one player in one round that make a highlight
+    include_clutches: bool = True  # a won clutch makes a highlight even below min_kills
+
+
+@dataclass(frozen=True)
+class Clutch:
+    player_steamid: int
+    since_tick: int  # tick the player became the last one alive on their side
+    enemies: int  # enemies alive at that tick: the N in 1vN
 
 
 def detect_highlights(
@@ -37,132 +45,105 @@ def detect_highlights(
 
     found: list[Highlight] = []
     for rnd in rounds:
-        round_kills = kills_by_round.get(rnd.number)
+        round_kills = in_round_kills(rnd, kills_by_round.get(rnd.number, []))
         if not round_kills:
             continue
         roster = rosters.get(rnd.number, {})
+        clutch = find_clutch(rnd, round_kills, roster) if cfg.include_clutches else None
 
-        multikills = _multikills(rnd, round_kills, cfg)
-        found += multikills
-        found += _clutches(rnd, round_kills, roster)
-        # A player-level ace already covers the moment, so skip the team-level one.
-        if not any(h.label == "ACE" for h in multikills):
-            found += _team_aces(rnd, round_kills, roster)
+        by_player: dict[int, list[Kill]] = defaultdict(list)
+        for kill in round_kills:
+            if is_enemy_kill(kill, roster):
+                by_player[kill.attacker_steamid].append(kill)
 
-    return sorted(found, key=lambda h: h.start_tick)
+        for player, player_kills in by_player.items():
+            player_clutch = clutch if clutch and clutch.player_steamid == player else None
+            if len(player_kills) >= cfg.min_kills or player_clutch:
+                found.append(_highlight(rnd, player, player_kills, roster, player_clutch))
 
-
-def _multikills(rnd: Round, round_kills: list[Kill], cfg: DetectConfig) -> list[Highlight]:
-    gap_ticks = cfg.streak_gap_s * cfg.tickrate
-    open_streaks: dict[int, list[Kill]] = {}
-    streaks: list[list[Kill]] = []
-
-    for kill in round_kills:
-        current = open_streaks.get(kill.attacker_steamid)
-        if current and kill.tick - current[-1].tick > gap_ticks:
-            streaks.append(current)
-            current = None
-        if current is None:
-            current = []
-            open_streaks[kill.attacker_steamid] = current
-        current.append(kill)
-    streaks.extend(open_streaks.values())
-
-    highlights = []
-    for streak in streaks:
-        if len(streak) < 2:
-            continue
-        first = streak[0]
-        won = rnd.winner_side is not None and first.attacker_side == rnd.winner_side
-        highlights.append(
-            Highlight(
-                kind="multikill",
-                label="ACE" if len(streak) >= 5 else f"{len(streak)}K",
-                round_num=rnd.number,
-                player_steamid=first.attacker_steamid,
-                player_name=first.attacker_name,
-                start_tick=first.tick,
-                end_tick=streak[-1].tick,
-                kills=len(streak),
-                won_round=won,
-                score=scoring.multikill_score(streak, won),
-                tags=scoring.kills_tags(streak),
-            )
-        )
-    return highlights
+    return sorted(found, key=lambda h: (h.start_tick, h.player_steamid))
 
 
-def _clutches(rnd: Round, round_kills: list[Kill], roster: dict[int, Side]) -> list[Highlight]:
-    """A clutch is a player left alone against N enemies who then wins the round."""
+def in_round_kills(rnd: Round, kills: list[Kill]) -> list[Kill]:
+    """Kills between round start and round end; kills after the round is decided are dropped."""
+    return [k for k in kills if rnd.start_tick <= k.tick <= rnd.end_tick]
+
+
+def is_enemy_kill(kill: Kill, roster: dict[int, Side]) -> bool:
+    """False for suicides and team kills, which do not count toward a player's highlight."""
+    if kill.attacker_steamid == kill.victim_steamid:
+        return False
+    attacker = roster.get(kill.attacker_steamid, kill.attacker_side)
+    victim = roster.get(kill.victim_steamid, kill.victim_side)
+    return attacker is None or victim is None or attacker != victim
+
+
+def highlight_label(kills: int, clutch_enemies: int = 0) -> str:
+    """'3K', 'ACE', '1v2', or both joined: '3K + 1v2'. A single kill only shows as '1K' without a clutch."""
+    parts = []
+    if kills >= 2 or not clutch_enemies:
+        parts.append("ACE" if kills >= 5 else f"{kills}K")
+    if clutch_enemies:
+        parts.append(f"1v{clutch_enemies}")
+    return " + ".join(parts)
+
+
+def find_clutch(rnd: Round, round_kills: list[Kill], roster: dict[int, Side]) -> Clutch | None:
+    """A player left alone against N enemies whose side wins the round, with a kill after that.
+
+    Only the winning side can clutch, so a round has at most one.
+    """
     if rnd.winner_side is None or not roster:
-        return []
+        return None
 
     alive = dict.fromkeys(roster)  # ordered set of steamids still alive
-    # side -> (lone player, tick they became alone, enemies still alive then)
-    lone: dict[Side, tuple[int, int, int]] = {}
+    lone: dict[Side, Clutch] = {}
 
-    for kill in round_kills:
-        alive.pop(kill.victim_steamid, None)
+    def note_lone_players(tick: int) -> None:
         for side in SIDES:
             if side in lone:
                 continue
             mates = [p for p in alive if roster.get(p) == side]
             foes = [p for p in alive if roster.get(p) == OTHER_SIDE[side]]
             if len(mates) == 1 and foes:
-                lone[side] = (mates[0], kill.tick, len(foes))
+                lone[side] = Clutch(player_steamid=mates[0], since_tick=tick, enemies=len(foes))
 
-    highlights = []
-    for side, (player, since_tick, enemies) in lone.items():
-        if side != rnd.winner_side:
-            continue
-        clutch_kills = [k for k in round_kills if k.attacker_steamid == player and k.tick >= since_tick]
-        if not clutch_kills:
-            continue
-        highlights.append(
-            Highlight(
-                kind="clutch",
-                label=f"1v{enemies}",
-                round_num=rnd.number,
-                player_steamid=player,
-                player_name=clutch_kills[0].attacker_name,
-                start_tick=clutch_kills[0].tick,
-                end_tick=clutch_kills[-1].tick,
-                kills=len(clutch_kills),
-                won_round=True,
-                score=scoring.clutch_score(enemies, clutch_kills),
-                tags=("clutch", *scoring.kills_tags(clutch_kills)),
-            )
-        )
-    return highlights
+    # A side can already be down to one player when the round starts (disconnects).
+    note_lone_players(rnd.start_tick)
+    for kill in round_kills:
+        alive.pop(kill.victim_steamid, None)
+        note_lone_players(kill.tick)
+
+    clutch = lone.get(rnd.winner_side)
+    if clutch is None:
+        return None
+    player, since = clutch.player_steamid, clutch.since_tick
+    if not any(k.attacker_steamid == player and k.tick >= since for k in round_kills):
+        return None
+    return clutch
 
 
-def _team_aces(rnd: Round, round_kills: list[Kill], roster: dict[int, Side]) -> list[Highlight]:
-    """One side kills every enemy that was alive at round start."""
-    highlights = []
-    for side in SIDES:
-        foes = {p for p, s in roster.items() if s == OTHER_SIDE[side]}
-        if not foes:
-            continue
-        mine = [k for k in round_kills if k.attacker_side == side and k.victim_steamid in foes]
-        if {k.victim_steamid for k in mine} != foes:
-            continue
-
-        top_steamid, _ = Counter(k.attacker_steamid for k in mine).most_common(1)[0]
-        top_name = next(k.attacker_name for k in mine if k.attacker_steamid == top_steamid)
-        won = rnd.winner_side == side
-        highlights.append(
-            Highlight(
-                kind="team_ace",
-                label="TEAM ACE",
-                round_num=rnd.number,
-                player_steamid=top_steamid,
-                player_name=top_name,
-                start_tick=mine[0].tick,
-                end_tick=mine[-1].tick,
-                kills=len(mine),
-                won_round=won,
-                score=scoring.team_ace_score(mine, won),
-                tags=("team_ace", *scoring.kills_tags(mine)),
-            )
-        )
-    return highlights
+def _highlight(
+    rnd: Round,
+    player: int,
+    kills: list[Kill],
+    roster: dict[int, Side],
+    clutch: Clutch | None,
+) -> Highlight:
+    side = roster.get(player, kills[0].attacker_side)
+    won = rnd.winner_side is not None and side == rnd.winner_side
+    enemies = clutch.enemies if clutch else 0
+    return Highlight(
+        kind="clutch" if clutch else "multikill",
+        label=highlight_label(len(kills), enemies),
+        round_num=rnd.number,
+        player_steamid=player,
+        player_name=kills[0].attacker_name,
+        start_tick=kills[0].tick,
+        end_tick=kills[-1].tick,
+        kills=len(kills),
+        won_round=won,
+        score=scoring.highlight_score(kills, won, enemies),
+        tags=(("clutch",) if clutch else ()) + scoring.kills_tags(kills),
+        kill_ticks=tuple(k.tick for k in kills),
+    )

@@ -1,4 +1,7 @@
+from dataclasses import replace
+
 from cs2hl.models import DemoData, DemoMeta, Kill, Round
+from cs2hl.parse import ParsedDemo, Scoreboard
 from cs2hl.scan import summarize
 
 
@@ -97,7 +100,7 @@ def test_scan_demo_turns_parser_panics_into_value_error(tmp_path, monkeypatch):
     def boom(path):
         raise Panic("range end index 16 out of range")
 
-    monkeypatch.setattr(parse, "load_demo", boom)
+    monkeypatch.setattr(parse, "read_demo", boom)
     bogus = tmp_path / "not_a_demo.dem"
     bogus.write_bytes(b"junk")
 
@@ -105,3 +108,38 @@ def test_scan_demo_turns_parser_panics_into_value_error(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="not_a_demo.dem"):
         scan_demo(bogus)
+
+
+def test_scoreboard_counts_replace_in_round_counts_for_players():
+    # Player 11 also got a kill after round 1 ended, and player 2 died to world damage.
+    board = Scoreboard(kills={1: 2, 11: 2, 12: 1}, deaths={2: 3, 11: 1, 12: 1})
+    scan = summarize(make_data(), board)
+    by_id = {p.steamid: p for p in scan.players}
+
+    assert (by_id[11].kills, by_id[11].deaths) == (2, 1)
+    assert (by_id[2].kills, by_id[2].deaths) == (0, 3)
+    assert (by_id[1].kills, by_id[1].deaths) == (2, 0)
+    assert [p.steamid for p in scan.players][:2] == [1, 11]  # 2 kills each, then by name
+    assert [r.kills for r in scan.rounds] == [3, 1]  # rounds still count in-round kills only
+
+
+def test_scan_exposes_parse_warnings():
+    data = replace(make_data(), warnings=("Found 2 rounds, but the game counted 3.",))
+
+    assert summarize(data).warnings == ("Found 2 rounds, but the game counted 3.",)
+    assert summarize(make_data()).warnings == ()
+
+
+def test_scan_demo_uses_the_scoreboard_counts(tmp_path, monkeypatch):
+    import cs2hl.parse as parse
+    from cs2hl.scan import scan_demo
+
+    board = Scoreboard(kills={1: 5}, deaths={1: 4})
+    monkeypatch.setattr(parse, "read_demo", lambda path: ParsedDemo(data=make_data(), scoreboard=board))
+
+    scan = scan_demo(tmp_path / "match.dem")
+    by_id = {p.steamid: p for p in scan.players}
+
+    assert (by_id[1].kills, by_id[1].deaths) == (5, 4)
+    assert by_id[11].kills == 0
+    assert len(scan.data.kills) == 4  # the in-round kills the highlights are made from

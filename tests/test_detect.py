@@ -1,4 +1,6 @@
-from cs2hl.detect import DetectConfig, detect_highlights
+import pytest
+
+from cs2hl.detect import DetectConfig, detect_highlights, highlight_label
 from cs2hl.models import Kill, Round
 
 TICKRATE = 64.0
@@ -8,15 +10,15 @@ ROSTER = {**{p: "T" for p in T_PLAYERS}, **{p: "CT" for p in CT_PLAYERS}}
 
 
 def kill(tick, attacker, victim, *, weapon="ak47", headshot=False, noscope=False,
-         through_smoke=False, wallbang=False, rnd=1):
+         through_smoke=False, wallbang=False, rnd=1, roster=ROSTER):
     return Kill(
         tick=tick,
         round_num=rnd,
         attacker_steamid=attacker,
         attacker_name=f"p{attacker}",
-        attacker_side=ROSTER[attacker],
+        attacker_side=roster[attacker],
         victim_steamid=victim,
-        victim_side=ROSTER[victim],
+        victim_side=roster[victim],
         weapon=weapon,
         headshot=headshot,
         noscope=noscope,
@@ -25,41 +27,53 @@ def kill(tick, attacker, victim, *, weapon="ak47", headshot=False, noscope=False
     )
 
 
-def run(kills, winner="T", roster=ROSTER, rnd_end=20000):
-    rounds = [Round(number=1, start_tick=0, end_tick=rnd_end, winner_side=winner)]
-    return detect_highlights(rounds, kills, {1: roster}, DetectConfig(tickrate=TICKRATE))
+def run(kills, winner="T", roster=ROSTER, rnd_start=0, rnd_end=20000, **cfg):
+    rounds = [Round(number=1, start_tick=rnd_start, end_tick=rnd_end, winner_side=winner)]
+    return detect_highlights(rounds, kills, {1: roster}, DetectConfig(tickrate=TICKRATE, **cfg))
 
 
-def by_kind(highlights, kind):
-    return [h for h in highlights if h.kind == kind]
+@pytest.mark.parametrize("count, label", [(2, "2K"), (3, "3K"), (4, "4K"), (5, "ACE")])
+def test_label_is_the_players_kill_count_in_the_round(count, label):
+    kills = [kill(1000 + i * 100, 1, victim) for i, victim in enumerate(CT_PLAYERS[:count])]
+
+    found = run(kills)
+
+    assert [(h.label, h.kind, h.kills) for h in found] == [(label, "multikill", count)]
 
 
-def test_three_kill_streak_is_a_3k_and_scores_win_bonus():
+def test_more_than_five_kills_is_still_an_ace():
+    roster = {**ROSTER, 16: "CT"}
+    kills = [kill(1000 + i * 100, 1, v, roster=roster) for i, v in enumerate([*CT_PLAYERS, 16])]
+
+    assert [h.label for h in run(kills, roster=roster)] == ["ACE"]
+
+
+def test_kills_far_apart_stay_one_highlight():
+    # A 4K spread over 40 s used to be split by the old 10 s streak gap.
+    ticks = [1000, 1000 + 12 * 64, 1000 + 25 * 64, 1000 + 40 * 64]
+    kills = [kill(t, 1, v) for t, v in zip(ticks, CT_PLAYERS)]
+
+    found = run(kills)
+
+    assert len(found) == 1
+    h = found[0]
+    assert h.label == "4K"
+    assert h.kill_ticks == tuple(ticks)
+    assert (h.start_tick, h.end_tick, h.kills) == (ticks[0], ticks[-1], 4)
+
+
+def test_win_bonus_and_score_for_a_3k():
     found = run([kill(1000, 1, 11), kill(1200, 1, 12), kill(1500, 1, 13)], winner="T")
 
-    multis = by_kind(found, "multikill")
-    assert len(multis) == 1
-    h = multis[0]
-    assert h.label == "3K"
-    assert h.player_steamid == 1
-    assert (h.start_tick, h.end_tick, h.kills) == (1000, 1500, 3)
+    h = found[0]
     assert h.won_round is True
     assert h.score == 8.0  # 3K base 6 + win bonus 2
-
-
-def test_gap_longer_than_streak_window_splits_kills():
-    # 10 s window = 640 ticks. Second kill is 100 ticks later, third is far after.
-    found = run([kill(1000, 1, 11), kill(1100, 1, 12), kill(3000, 1, 13)])
-
-    multis = by_kind(found, "multikill")
-    assert [h.label for h in multis] == ["2K"]
-    assert (multis[0].start_tick, multis[0].end_tick) == (1000, 1100)
 
 
 def test_lost_round_does_not_get_win_bonus():
     found = run([kill(1000, 1, 11), kill(1100, 1, 12)], winner="CT")
 
-    h = by_kind(found, "multikill")[0]
+    h = found[0]
     assert h.won_round is False
     assert h.score == 3.0  # 2K base only
 
@@ -68,27 +82,67 @@ def test_tags_and_bonuses_for_special_kills():
     found = run(
         [
             kill(1000, 1, 11, headshot=True),
-            kill(1100, 1, 12, weapon="knife", through_smoke=True),
+            kill(1100, 1, 12, weapon="knife_karambit", through_smoke=True),
         ],
         winner="T",
     )
 
-    h = by_kind(found, "multikill")[0]
+    h = found[0]
     assert set(h.tags) == {"headshot", "knife", "smoke"}
     # base 3 + headshot 0.5 + knife 2 + smoke 1 + win 2
     assert h.score == 8.5
 
 
-def test_five_kills_by_one_player_is_an_ace_and_suppresses_team_ace():
-    kills = [kill(1000 + i * 100, 1, victim) for i, victim in enumerate(CT_PLAYERS)]
+def test_single_kill_is_not_a_highlight_by_default():
+    assert run([kill(1000, 1, 11), kill(1100, 2, 12)]) == []
+
+
+def test_min_kills_is_configurable():
+    kills = [kill(1000, 1, 11), kill(1100, 1, 12), kill(1200, 2, 13)]
+
+    assert [h.player_steamid for h in run(kills, min_kills=3)] == []
+    assert [(h.player_steamid, h.label) for h in run(kills, min_kills=1)] == [(1, "2K"), (2, "1K")]
+
+
+def test_team_wipe_with_spread_kills_is_not_a_highlight():
+    # Every CT dies, one kill each by five different T players: the old "TEAM ACE".
+    kills = [kill(1000 + i * 100, p, 11 + i) for i, p in enumerate(T_PLAYERS)]
     found = run(kills, winner="T")
 
-    labels = [h.label for h in found]
-    assert "ACE" in labels
-    assert "TEAM ACE" not in labels
+    assert found == []
 
 
-def test_clutch_1v2_on_round_win():
+def test_each_player_with_enough_kills_gets_their_own_highlight():
+    kills = [kill(1000, 1, 11), kill(1100, 2, 12), kill(1200, 1, 13), kill(1300, 2, 14)]
+    found = run(kills)
+
+    assert [(h.player_steamid, h.label, h.kill_ticks) for h in found] == [
+        (1, "2K", (1000, 1200)),
+        (2, "2K", (1100, 1300)),
+    ]
+
+
+def test_same_player_in_two_rounds_gets_two_highlights():
+    rounds = [
+        Round(number=1, start_tick=0, end_tick=5000, winner_side="T"),
+        Round(number=2, start_tick=6000, end_tick=12000, winner_side="CT"),
+    ]
+    kills = [kill(1000, 1, 11), kill(1100, 1, 12), kill(7000, 1, 11, rnd=2), kill(7100, 1, 12, rnd=2)]
+    found = detect_highlights(rounds, kills, {1: ROSTER, 2: ROSTER}, DetectConfig(tickrate=TICKRATE))
+
+    assert [(h.round_num, h.won_round) for h in found] == [(1, True), (2, False)]
+
+
+def test_kills_after_round_end_and_team_kills_do_not_count():
+    kills = [
+        kill(1000, 1, 11),
+        kill(1100, 1, 2),  # team kill
+        kill(2100, 1, 12),  # after the round ended at 2000
+    ]
+    assert run(kills, rnd_end=2000) == []
+
+
+def test_clutch_1v2_with_2k():
     # Start with T: 1, 2, 3 and CT: 11, 12. T2 and T3 die, leaving T1 alone vs two.
     roster = {1: "T", 2: "T", 3: "T", 11: "CT", 12: "CT"}
     kills = [
@@ -99,32 +153,65 @@ def test_clutch_1v2_on_round_win():
     ]
     found = run(kills, winner="T", roster=roster)
 
-    clutches = by_kind(found, "clutch")
-    assert len(clutches) == 1
-    c = clutches[0]
-    assert c.label == "1v2"
+    assert len(found) == 1
+    c = found[0]
+    assert c.kind == "clutch"
+    assert c.label == "2K + 1v2"
     assert c.player_steamid == 1
-    assert (c.start_tick, c.end_tick, c.kills) == (900, 1000, 2)
-    assert "clutch" in c.tags
+    assert (c.start_tick, c.end_tick, c.kills, c.kill_ticks) == (900, 1000, 2, (900, 1000))
+    assert c.tags[0] == "clutch"
+    assert c.score == 13.0  # 2K 3 + clutch 2 + 3 * 2 + win 2
+
+
+def test_kills_before_the_clutch_count_toward_the_label():
+    roster = {1: "T", 2: "T", 11: "CT", 12: "CT"}
+    kills = [
+        kill(400, 1, 11),
+        kill(600, 12, 2),  # T1 is now alone vs 12
+        kill(900, 1, 12),
+    ]
+    found = run(kills, winner="T", roster=roster)
+
+    assert [(h.label, h.kill_ticks) for h in found] == [("2K + 1v1", (400, 900))]
+
+
+def test_single_kill_clutch_is_a_highlight_unless_clutches_are_off():
+    roster = {1: "T", 2: "T", 11: "CT"}
+    kills = [kill(500, 11, 2), kill(900, 1, 11)]
+
+    found = run(kills, winner="T", roster=roster)
+    assert [(h.label, h.kind, h.kills) for h in found] == [("1v1", "clutch", 1)]
+    assert run(kills, winner="T", roster=roster, include_clutches=False) == []
 
 
 def test_no_clutch_when_the_lone_player_loses_the_round():
+    roster = {1: "T", 2: "T", 3: "T", 11: "CT", 12: "CT"}
     kills = [kill(500, 11, 2), kill(800, 12, 3), kill(900, 1, 11), kill(1000, 1, 12)]
-    found = run(kills, winner="CT", roster={1: "T", 2: "T", 3: "T", 11: "CT", 12: "CT"})
+    found = run(kills, winner="CT", roster=roster)
 
-    assert by_kind(found, "clutch") == []
+    assert [(h.label, h.kind) for h in found] == [("2K", "multikill")]
 
 
-def test_team_ace_when_one_side_kills_all_enemies_with_no_single_player_ace():
-    kills = [kill(1000 + i * 100, p, 11 + i) for i, p in enumerate(T_PLAYERS)]
-    found = run(kills, winner="T")
+def test_side_alone_from_round_start_counts_every_enemy():
+    roster = {1: "T", 11: "CT", 12: "CT"}
+    kills = [kill(900, 1, 11, roster=roster), kill(1000, 1, 12, roster=roster)]
 
-    aces = by_kind(found, "team_ace")
-    assert len(aces) == 1
-    assert aces[0].label == "TEAM ACE"
-    assert aces[0].kills == 5
-    assert aces[0].won_round is True
-    assert by_kind(found, "multikill") == []
+    assert [h.label for h in run(kills, winner="T", roster=roster, rnd_start=100)] == ["2K + 1v2"]
+
+
+def test_ace_clutch_label():
+    roster = {1: "T", 2: "T", **{p: "CT" for p in CT_PLAYERS}}
+    kills = [kill(500, 11, 2), *[kill(1000 + i * 100, 1, v) for i, v in enumerate(CT_PLAYERS)]]
+
+    assert [h.label for h in run(kills, roster=roster)] == ["ACE + 1v5"]
+
+
+def test_highlight_label_parts():
+    assert highlight_label(2) == "2K"
+    assert highlight_label(1) == "1K"
+    assert highlight_label(1, 1) == "1v1"
+    assert highlight_label(3, 2) == "3K + 1v2"
+    assert highlight_label(7) == "ACE"
 
 
 def test_no_highlights_for_round_without_kills():

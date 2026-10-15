@@ -142,3 +142,47 @@ Consequences for the design:
    runs, the take folder appears, and the clip reaches `recordings/`.
 3. Decide POV: find the CS2 command that switches the view, or accept the demo camera
    for now.
+
+## 9. Version 0.2: unattended recording (2026-10-15)
+
+Sections 6-8 describe the first HLAE design, where the user typed `exec` in the console.
+Version 0.2 replaces it. The sources for this section are HLAE (`advancedfx/advancedfx`,
+MIT) and CS Demo Manager (`akiver/cs-demo-manager`, MIT), both read locally, plus runs of
+the parser on two public demos.
+
+What changed and why:
+
+| Area | 0.1 | 0.2 | Evidence |
+|---|---|---|---|
+| Round winner | assumed 2/3 | `T`/`CT` strings (2/3 still accepted) | real demos crashed 0.1 |
+| Rounds | every round_start | rounds after the last `begin_new_match`; knife and warmup dropped | FACEIT demo: 25 -> 24 rounds |
+| Tickrate | header keys (absent) | from `game_time`, fallback 64 | both demos 64.0 |
+| Self-check | none | compares rounds, kills, deaths and score with the game's counters | both demos match exactly |
+| Highlights | streaks with a 10 s gap, team ace | one per player per round, kill windows cut together | FACEIT: 30 clips / 971 s / 22 team aces -> 42 clips / 407 s recorded |
+| Camera | none | `spec_mode 1` + `spec_player <user_id + 1>` per piece | CS Demo Manager convention; slot equals `m_hController & 0x3FFF` on both demos |
+| Kill feed | full HUD | `cl_draw_only_deathnotices 1` + `mirv_deathmsg` filter for the player | CS Demo Manager recipe |
+| Launch | user types `exec` | `HLAE.exe -customLoader -noGui -autoStart` with `+exec cs2hl_boot` | HLAE `Program.cs`, CS Demo Manager launcher |
+| Done | poll files until timeout | `quit` in the script, wait for `cs2.exe` to exit | CS Demo Manager |
+| Output | one file per clip | pieces joined per clip; clips, montage or both | export tests with sound-sync markers |
+| Paths | typed by the user | Steam registry key + `libraryfolders.vdf` | CS Demo Manager |
+
+One HLAE detail matters for the schedule: `mirv_cmd`'s interval tree only follows one
+branch on a big forward step, so commands added out of tick order can be skipped. The
+generated script adds commands in tick order (simulated in Python from `CommandSystem.h`).
+
+Still unverified until the first run on Windows:
+
+- `+exec cs2hl_boot` runs after HLAE registers its `mirv_` commands, and `playdemo` from that
+  script loads the demo.
+- `spec_player <slot>` follows the chosen player in GOTV demos.
+- The HUD and kill-feed commands work in demo playback without `sv_cheats`.
+- A `-sw -w 2560 -h 1440` window records at full size on the user's monitor.
+- HLAE's FFmpeg closes each `video.mp4` before the app collects it.
+
+First run checklist (Setup tab all green, then one short demo and one player):
+
+1. The CS2 console shows `Recording to "...\work\<clip>_s0\take0000"` for each piece and no
+   `Unknown command` lines.
+2. Each clip shows the chosen player's view, and the kill feed shows only their kills.
+3. CS2 closes by itself at the end and the videos appear in the output folder.
+4. If something fails, the app's log and `<CS2>\game\csgo\cfg\cs2hl_boot.cfg` are what to send.

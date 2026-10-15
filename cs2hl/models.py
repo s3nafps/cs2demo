@@ -47,8 +47,8 @@ class Kill:
 
 @dataclass(frozen=True)
 class Highlight:
-    kind: str  # "multikill" | "clutch" | "team_ace"
-    label: str  # "3K", "ACE", "1v2", "TEAM ACE"
+    kind: str  # "multikill" | "clutch"
+    label: str  # "3K", "ACE", "1v2", "3K + 1v2"
     round_num: int
     player_steamid: int
     player_name: str
@@ -96,3 +96,4 @@ class DemoData:
     rosters: Rosters
     player_names: dict[int, str]
     player_slots: dict[int, int] = field(default_factory=dict)  # steamid -> spectator slot
+    warnings: tuple[str, ...] = ()  # where the parse disagrees with the game's own counters
