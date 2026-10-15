@@ -11,7 +11,7 @@ from .capture import CaptureBackend, CaptureCancelled, CaptureResult, CaptureSet
 from .detect import DetectConfig, detect_highlights
 from .export import ExportResult, export_plan, recording_for
 from .ffmpeg import Aspect, EncodeSettings, VerticalMode
-from .models import DemoData, Plan
+from .models import DemoData, OutputMode, Plan
 from .planner import PlanConfig, build_plan
 from .selection import Selection, filter_highlights
 
@@ -23,6 +23,9 @@ class HighlightOptions:
     post_roll_s: float = 2.0
     min_score: float = 5.0
     max_clips: int | None = None
+    min_kills: int = 2  # a round needs this many kills by the player to count
+    include_clutches: bool = True  # a won clutch counts even below min_kills
+    merge_gap_s: float = 3.0  # kill windows closer than this become one piece
 
 
 def plan_highlights(data: DemoData, selection: Selection, opts: HighlightOptions | None = None) -> Plan:
@@ -50,6 +53,7 @@ def plan_highlights(data: DemoData, selection: Selection, opts: HighlightOptions
 
 @dataclass(frozen=True)
 class RenderOptions:
+    output: OutputMode = "montage"
     aspects: tuple[Aspect, ...] = ("16x9", "9x16")
     vertical_mode: VerticalMode = "crop"
     x_offset: float = 0.0

@@ -7,6 +7,9 @@ from typing import Literal
 
 Side = Literal["T", "CT"]
 
+# What the export step writes: one video with every highlight, one file per highlight, or both.
+OutputMode = Literal["montage", "clips", "both"]
+
 # round number -> steamid -> side, for players alive at the start of that round
 Rosters = dict[int, dict[int, Side]]
 
@@ -55,6 +58,7 @@ class Highlight:
     won_round: bool
     score: float
     tags: tuple[str, ...] = ()
+    kill_ticks: tuple[int, ...] = ()  # ticks of the player's kills that make up this moment
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,10 @@ class Clip:
     score: float
     labels: tuple[str, ...]
     tags: tuple[str, ...]
+    # Recorded pieces of the clip, as (start_tick, end_tick), joined with cuts on export.
+    # Empty means one piece from start_tick to end_tick.
+    segments: tuple[tuple[int, int], ...] = ()
+    pov_slot: int | None = None  # CS2 spectator slot of the POV player (demoparser2 user_id + 1)
 
 
 @dataclass
@@ -87,3 +95,4 @@ class DemoData:
     kills: list[Kill]
     rosters: Rosters
     player_names: dict[int, str]
+    player_slots: dict[int, int] = field(default_factory=dict)  # steamid -> spectator slot

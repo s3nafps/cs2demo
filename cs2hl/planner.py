@@ -130,6 +130,7 @@ def load_plan(path: Path) -> Plan:
                 **c,
                 "labels": tuple(c["labels"]),
                 "tags": tuple(c["tags"]),
+                "segments": tuple(tuple(seg) for seg in c.get("segments", ())),
             }
         )
         for c in data["clips"]

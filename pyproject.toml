@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cs2hl"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local CS2 demo highlight generator: detects multikills, aces and clutches and exports 16:9 and 9:16 clips."
 requires-python = ">=3.11"
-dependencies = ["demoparser2>=0.42", "pandas>=2"]
+dependencies = ["demoparser2==0.42.0", "pandas>=2", "psutil>=5.9"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
